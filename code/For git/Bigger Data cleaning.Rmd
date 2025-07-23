@@ -6,20 +6,21 @@ library(ggplot2)
 library(readxl)
 library(data.table)
 
+
 demo_cols <- c("MRN_DEID", "race", "ethnic", "sex")
-demo_data <- fread("Z:/Kucirek/dr_592588_demo.csv", select = demo_cols)
+demo_data <- fread("Z:/Kucirek/Data(Do not touch!)/dr_592588_demo.csv", select = demo_cols)
 setnames(demo_data, tolower(names(demo_data)))
 
 # Depression
 depression_cols <- c("MRN_DEID", "PHQ_DTTM", "PHQ_FIELD", "PHQ_VALUE")
-depression_data <- fread("Z:/Kucirek/DR_592588_DEPRESSION.txt", select = depression_cols)
+depression_data <- fread("Z:/Kucirek/Data(Do not touch!)/DR_592588_DEPRESSION.txt", select = depression_cols)
 setnames(depression_data, tolower(names(depression_data)))
 
 encounter_cols <- c("MRN_DEID", "age_at_encounter", "FIN_CLASS", "APPT_DEPT", "ICD10_DX", "ICD_DIAGNOSIS", "ENC_DATE")
 
 # Load and filter for age >= 18 in one step
 encounters_data <- fread(
-  "Z:/Kucirek/dr_592588_encounter.txt",
+  "Z:/Kucirek/Data(Do not touch!)/dr_592588_encounter.txt",
   select = encounter_cols
 )[age_at_encounter >= 18]
 
