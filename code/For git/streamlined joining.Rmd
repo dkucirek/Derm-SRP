@@ -1,0 +1,544 @@
+
+making all columns with mrn 'trimmed'
+Getting counts of unique MRNS in each of the three datasets I'm using, the Demographics, Depression screens and Encounters 
+```{r}
+library(data.table)
+library(dplyr)
+
+# Convert to data.table and clean MRNs
+datasets <- list(demo_data, depression_data, encounters_data)
+lapply(datasets, setDT)
+lapply(datasets, function(dt) dt[, mrn_deid := as.character(trimws(mrn_deid))])
+
+# Keep unique MRNs in demo_data
+demo_data <- unique(demo_data, by = "mrn_deid")
+cat("Unique MRNs in demo data:", uniqueN(demo_data$mrn_deid), "\n")
+
+# Function to count non-missing PHQ responses
+count_phq_responses <- function(data, phq_fields) {
+  data %>%
+    filter(phq_field %in% phq_fields, !is.na(phq_value), phq_value != "") %>%
+    nrow()
+}
+
+# Output PHQ response counts
+cat("PHQ-2 total or POS/NEG:", count_phq_responses(depression_data, c("PHQ-2 Total Score", "CMS PHQ-2 POS/NEG")), "\n")
+cat("PHQ-2 POS/NEG responses:", count_phq_responses(depression_data, "CMS PHQ-2 POS/NEG"), "\n")
+cat("PHQ-9 total or POS/NEG:", count_phq_responses(depression_data, c("PHQ-9 Total Score", "CMS PHQ-9 POS/NEG")), "\n")
+cat("PHQ-9 Total Score responses:", count_phq_responses(depression_data, "PHQ-9 Total Score"), "\n")
+
+# Add PHQ-9 POS/NEG only count
+cat("PHQ-9 POS/NEG:", count_phq_responses(depression_data, "CMS PHQ-9 POS/NEG"), "\n")
+
+# Merge demo and depression data on MRN
+dd_merged <- merge(demo_data, depression_data, by = "mrn_deid", all = FALSE)
+setDT(dd_merged)
+
+# Report unique MRNs
+cat("Unique MRNs in dd_merged:", uniqueN(dd_merged$mrn_deid), "\n")
+cat("Unique MRNs in encounters_data:", uniqueN(encounters_data$mrn_deid), "\n")
+
+```
+checking if the phq9 pos/neg and total sums overlap or are all one vs the other -- so 56,859 screens have both the pos/neg and total recorded, 3178 have only pos/neg, 3382 have only total score listed, 2,229 have neither 
+```{r}
+library(data.table)
+
+# Assuming depression_data is a data.table with columns: mrn_deid, phq_dttm, phq_field, phq_value
+
+# Filter for PHQ-9 related fields
+phq9_data <- depression_data[phq_field %in% c("PHQ-9 Total Score", "CMS PHQ-9 POS/NEG")]
+
+# Summarize per MRN and phq_dttm whether Total Score and/or POS/NEG present
+phq9_summary <- phq9_data[, .(
+  has_total_score = any(phq_field == "PHQ-9 Total Score" & !is.na(phq_value) & phq_value != ""),
+  has_posneg = any(phq_field == "CMS PHQ-9 POS/NEG" & !is.na(phq_value) & phq_value != "")
+), by = .(mrn_deid, phq_dttm)]
+
+# Count the overlap categories
+overlap_counts <- phq9_summary[, .N, by = .(
+  has_total_score,
+  has_posneg
+)]
+
+print(overlap_counts)
+
+sum_counts <- sum(c(56859, 2229, 3178))
+print(sum_counts)
+```
+checking with earlier---
+Total screens with Total Score = 56,859 (both) + 3,382 (only total) = 60,241
+
+Total screens with POS/NEG = 56,859 (both) + 3,178 (only posneg) = 60,037
+
+so this checks out 
+
+this is good, it shows that there aren't any phq9 screens that are fully completed but not listed as complete, either pos or neg 
+
+```{r}
+library(dplyr)
+
+# Define the PHQ-9 item fields *before* you use them
+phq9_items <- c(
+  "feeling down, depressed, or hopeless score",
+  "little interest or pleasure in doing things score",
+  "thoughts that you would be better off dead or of hurting yourself score",
+  "feeling tired or having little energy score",
+  "trouble falling or staying asleep, or sleep too much score",
+  "poor appetite or overeating score",
+  "trouble concentrating on things, such as reading the newspaper or watching television score",
+  "feeling bad about yourself or that you are a failure or have let yourself or your family down score",
+  "moving or speaking so slowly that other people have noticed. Or the opposite score"
+)
+
+# Summarize by patient and date (screen)
+phq9_summary <- phq9_data %>%
+  group_by(mrn_deid, phq_dttm) %>%
+  summarize(
+    has_total_score = any(phq_field == "PHQ-9 Total Score" & !is.na(phq_value)),
+    has_posneg = any(phq_field == "CMS PHQ-9 POS/NEG" & !is.na(phq_value)),
+    n_items_present = sum(phq_field %in% phq9_items & !is.na(phq_value)),
+    .groups = "drop"
+  )
+
+# Filter screens that have neither total score nor POS/NEG
+no_scores <- phq9_summary %>%
+  filter(!has_total_score, !has_posneg)
+
+# Count how many of those have all 9 PHQ-9 items present
+complete_no_scores <- no_scores %>%
+  filter(n_items_present == 9) %>%
+  nrow()
+
+cat("Screens with neither score but all 9 PHQ-9 items present:", complete_no_scores, "\n")
+
+```
+
+converting dates to Date type, defining phq fields, making window around screening times and around phq2 and 9s 
+```{r}
+# Convert screening dates to Date type and rename
+dd_merged[, phq_date := as.Date(phq_dttm)]
+encounters_data[, enc_date := as.Date(enc_date)]
+
+# Convert PHQ values to numeric where applicable
+dd_merged[, phq_value_num := fifelse(
+  tolower(phq_value) %in% c("positive", "negative", ""),
+  NA_real_,
+  as.numeric(phq_value)
+)]
+
+# Define PHQ fields of interest (13 fields)
+keep_fields <- c(
+  "feeling down, depressed, or hopeless score",
+  "little interest or pleasure in doing things score",
+  "feeling tired or having little energy score",
+  "trouble falling or staying asleep, or sleep too much score",
+  "thoughts that you would be better off dead or of hurting yourself score",
+  "trouble concentrating on things, such as reading the newspaper or watching television score",
+  "feeling bad about yourself or that you are a failure or have let yourself or your family down score",
+  "CMS PHQ-9 POS/NEG",
+  "moving or speaking so slowly that other people have noticed. Or the opposite score",
+  "poor appetite or overeating score",
+  "PHQ-9 Total Score",
+  "PHQ-2 score",
+  "CMS PHQ-2 POS/NEG"
+)
+
+# Create ±1 month window around PHQ screening dates
+dd_merged[, `:=`(window_start = phq_date %m-% months(1), window_end = phq_date %m+% months(1))]
+encounters_data[, `:=`(enc_start = enc_date, enc_end = enc_date)]
+
+# Set keys for data.table overlaps
+setkey(dd_merged, mrn_deid, window_start, window_end)
+setkey(encounters_data, mrn_deid, enc_start, enc_end)
+
+# Join encounters with PHQ screenings within ±1 month
+result_all_matches <- foverlaps(encounters_data, dd_merged,
+  by.x = c("mrn_deid", "enc_start", "enc_end"),
+  by.y = c("mrn_deid", "window_start", "window_end"),
+  type = "any", nomatch = 0L
+)
+
+# Filter for only PHQ fields of interest
+result_all_matches <- result_all_matches[phq_field %in% keep_fields]
+
+# Compute absolute date difference between encounter and screening
+result_all_matches[, date_diff := abs(as.numeric(enc_date - phq_date))]
+
+# Keep the closest PHQ screening for each (mrn, encounter, phq_field)
+result_closest_all <- result_all_matches[
+  order(mrn_deid, enc_date, phq_field, date_diff)
+][
+  , .SD[1], by = .(mrn_deid, enc_date, phq_field)
+]
+
+cat("Unique MRNs in filtered result:", uniqueN(result_closest_all$mrn_deid), "\n")
+
+# Pivot to wide format: one row per (mrn, encounter)
+result_wide <- result_closest_all %>%
+  as_tibble() %>%
+  pivot_wider(
+    id_cols = c(mrn_deid, enc_date),
+    names_from = phq_field,
+    values_from = c(phq_value, phq_value_num, phq_date),
+    names_glue = "{.value}_{phq_field}"
+  )
+
+```
+Now, making results wide, and manually calculating phq9 scores when all fields are filled out 
+```{r}
+result_wide <- result_closest_all %>%
+  as_tibble() %>%
+  pivot_wider(
+    id_cols = c(mrn_deid, enc_date, appt_dept, icd10_dx, icd_diagnosis),
+    names_from = phq_field,
+    values_from = c(phq_value, phq_value_num, phq_date),
+    names_glue = "{.value}_{phq_field}"
+  )
+phq9_items <- c(
+  "phq_value_num_feeling tired or having little energy score",
+  "phq_value_num_poor appetite or overeating score",
+  "phq_value_num_little interest or pleasure in doing things score",
+  "phq_value_num_feeling down, depressed, or hopeless score",
+  "phq_value_num_moving or speaking so slowly that other people have noticed. Or the opposite score",
+  "phq_value_num_feeling bad about yourself or that you are a failure or have let yourself or your family down score",
+  "phq_value_num_thoughts that you would be better off dead or of hurting yourself score",
+  "phq_value_num_trouble falling or staying asleep, or sleep too much score",
+  "phq_value_num_trouble concentrating on things, such as reading the newspaper or watching television score"
+)
+
+#only computing when all 9 are present 
+result_wide <- result_wide %>%
+  mutate(
+    n_items_present = rowSums(!is.na(across(all_of(phq9_items)))),
+    phq9_manual_sum = case_when(
+      n_items_present == 9 ~ rowSums(across(all_of(phq9_items)), na.rm = FALSE),
+      TRUE ~ NA_real_
+    )
+  )
+
+# Optional: Use the actual PHQ screening date from one of the fields (if you still want phq_date)
+result_wide <- result_wide %>%
+  mutate(phq_date = coalesce(
+    `phq_date_PHQ-9 Total Score`,
+    `phq_date_CMS PHQ-9 POS/NEG`,
+    `phq_date_CMS PHQ-2 POS/NEG`
+  ))
+
+cols_order <- c(
+  "mrn_deid", "enc_date", "phq_date",
+  "phq_value_CMS PHQ-2 POS/NEG", "phq_value_num_PHQ-2 score",
+  "phq_value_CMS PHQ-9 POS/NEG", "phq_value_num_PHQ-9 Total Score",
+  "phq9_manual_sum"
+)
+
+result_wide_subset <- result_wide %>%
+  select(any_of(cols_order))
+
+n_unique_encounters <- result_wide_subset %>%
+  distinct(mrn_deid, enc_date, phq_date) %>%
+  nrow()
+
+n_unique_mrns <- result_wide_subset %>%
+  distinct(mrn_deid) %>%
+  nrow()
+
+cat("Unique encounter combos (MRN, enc_date, phq_date):", n_unique_encounters, "\n")
+cat("Unique MRNs in final result:", n_unique_mrns, "\n")
+
+```
+
+```{r}
+library(dplyr)
+
+result_wide_subset %>%
+  mutate(
+    phq9_source = case_when(
+      !is.na(`phq_value_num_PHQ-9 Total Score`) ~ "PHQ-9 Total present",
+      is.na(`phq_value_num_PHQ-9 Total Score`) & !is.na(phq9_manual_sum) ~ "Manual sum only",
+      TRUE ~ "No PHQ-9"
+    )
+  ) %>%
+  count(phq9_source)
+```
+
+talk with Dr Laiteerapong said some were phq8 and not 9 so calculating how many had 8 filled out. also looking at full count distribution
+```{r}
+result_wide %>%
+  filter(n_items_present == 8) %>%
+  nrow()
+
+result_wide %>%
+  count(n_items_present, sort = TRUE)
+
+phq9_item_presence <- result_wide %>%
+  summarise(across(all_of(phq9_items), ~ sum(!is.na(.)), .names = "present_{.col}")) %>%
+  pivot_longer(everything(), names_to = "phq_item", values_to = "present_count") %>%
+  arrange(desc(present_count))
+
+phq9_item_presence
+#so this is showing that most of the responses are actually the first two, which double as the phq
+
+```
+doing some phq2 checking-- freq of total score listed, freq of manual score, freq of ps/neg listed and freq of ps/neg possible to be calculated 
+
+```{r}
+library(dplyr)
+
+# 1. PHQ-2 numeric items columns
+phq2_items <- c(
+  "phq_value_num_little interest or pleasure in doing things score",
+  "phq_value_num_feeling down, depressed, or hopeless score"
+)
+
+# 2 & 3. Add columns for presence and manual sum if all 2 items present
+result_wide <- result_wide %>%
+  mutate(
+    phq2_num_items_present = rowSums(!is.na(across(all_of(phq2_items)))),
+    phq2_manual_sum = case_when(
+      phq2_num_items_present == length(phq2_items) ~ rowSums(across(all_of(phq2_items)), na.rm = FALSE),
+      TRUE ~ NA_real_
+    )
+  )
+
+# 4. Define manual POS/NEG based on sum >=3 (standard cutoff)
+result_wide <- result_wide %>%
+  mutate(
+    phq2_manual_posneg = case_when(
+      is.na(phq2_manual_sum) ~ NA_character_,
+      phq2_manual_sum >= 3 ~ "Positive",
+      phq2_manual_sum < 3 ~ "Negative"
+    )
+  )
+
+# 5. Presence of recorded total score & pos/neg fields
+result_wide <- result_wide %>%
+  mutate(
+    phq2_total_score_present = !is.na(`phq_value_num_PHQ-2 score`),
+    phq2_posneg_recorded = !is.na(`phq_value_CMS PHQ-2 POS/NEG`),
+    phq2_posneg_recorded_value = `phq_value_CMS PHQ-2 POS/NEG`
+  )
+
+# 6. Frequency counts
+
+freq_summary <- tibble(
+  Description = c(
+    "PHQ-2 total numeric score present",
+    "PHQ-2 numeric items present but no total score",
+    "PHQ-2 POS/NEG recorded (any)",
+    "PHQ-2 POS/NEG recorded Positive",
+    "PHQ-2 POS/NEG recorded Negative",
+    "PHQ-2 manual POS/NEG Positive",
+    "PHQ-2 manual POS/NEG Negative"
+  ),
+  Count = c(
+    sum(result_wide$phq2_total_score_present, na.rm = TRUE),
+    sum(result_wide$phq2_num_items_present == length(phq2_items) & !result_wide$phq2_total_score_present, na.rm = TRUE),
+    sum(result_wide$phq2_posneg_recorded, na.rm = TRUE),
+    sum(result_wide$phq2_posneg_recorded_value == "Positive", na.rm = TRUE),
+    sum(result_wide$phq2_posneg_recorded_value == "Negative", na.rm = TRUE),
+    sum(result_wide$phq2_manual_posneg == "Positive", na.rm = TRUE),
+    sum(result_wide$phq2_manual_posneg == "Negative", na.rm = TRUE)
+  )
+)
+
+print(freq_summary)
+
+
+```
+
+```{r}
+result_wide %>%
+  mutate(
+    manual_phq2_score = rowSums(across(all_of(c(
+      "phq_value_num_feeling down, depressed, or hopeless score",
+      "phq_value_num_little interest or pleasure in doing things score"
+    ))), na.rm = FALSE),
+    phq2_score_reported = `phq_value_num_PHQ-2 score`,
+    phq9_total_score = `phq_value_num_PHQ-9 Total Score`
+  ) %>%
+  summarise(
+    total_rows = n(),
+    manual_phq2_present = sum(!is.na(manual_phq2_score)),
+    phq2_reported_present = sum(!is.na(phq2_score_reported)),
+    phq9_total_present = sum(!is.na(phq9_total_score)),
+    both_manual_and_reported = sum(!is.na(manual_phq2_score) & !is.na(phq2_score_reported)),
+    manual_phq2_and_phq9_total = sum(!is.na(manual_phq2_score) & !is.na(phq9_total_score))
+  )
+
+```
+
+so this is good, it shows that my manual phq9 sums are working correctly and are aligning with the phq9 total column 
+so that is saying for the phq9 values where both manual and automatic sum exist, they are matching, but doesn't say anything about the ones with just the manual phq9
+
+consistency check---
+```{r}
+phq9_comparison <- result_wide_subset %>%
+  filter(!is.na(`phq_value_num_PHQ-9 Total Score`), !is.na(phq9_manual_sum)) %>%
+  mutate(score_diff = abs(`phq_value_num_PHQ-9 Total Score` - phq9_manual_sum))
+
+# Summary of differences
+summary_stats <- phq9_comparison %>%
+  summarise(
+    n = n(),
+    exact_match = sum(score_diff == 0),
+    within_1_point = sum(score_diff <= 1),
+    mean_diff = mean(score_diff),
+    sd_diff = sd(score_diff)
+  )
+
+print(summary_stats)
+
+```
+
+```{r}
+result_wide %>%
+  filter(!is.na(phq2_manual_posneg) & !is.na(phq2_posneg_recorded_value)) %>%
+  summarise(
+    total = n(),
+    agreement = sum(phq2_manual_posneg == phq2_posneg_recorded_value),
+    agreement_pct = mean(phq2_manual_posneg == phq2_posneg_recorded_value) * 100
+  )
+
+```
+```{r}
+library(dplyr)
+library(tidyr)
+
+comparison_summary <- result_wide %>%
+  mutate(
+    manual_phq2_score = rowSums(across(all_of(c(
+      "phq_value_num_feeling down, depressed, or hopeless score",
+      "phq_value_num_little interest or pleasure in doing things score"
+    ))), na.rm = FALSE),
+
+    phq2_score_reported = `phq_value_num_PHQ-2 score`,
+    phq9_total_score_reported = `phq_value_num_PHQ-9 Total Score`,
+    manual_phq9_score = phq9_manual_sum,
+
+    phq2_posneg_recorded = `phq_value_CMS PHQ-2 POS/NEG`,
+    phq9_posneg_recorded = `phq_value_CMS PHQ-9 POS/NEG`
+  ) %>%
+  summarise(
+    total_rows = n(),
+
+    # PHQ-2 comparisons
+    phq2_manual_present = sum(!is.na(manual_phq2_score)),
+    phq2_reported_present = sum(!is.na(phq2_score_reported)),
+    phq2_both_manual_and_reported = sum(!is.na(manual_phq2_score) & !is.na(phq2_score_reported)),
+    phq2_only_manual = sum(!is.na(manual_phq2_score) & is.na(phq2_score_reported)),
+    phq2_only_reported = sum(is.na(manual_phq2_score) & !is.na(phq2_score_reported)),
+
+    phq2_posneg_present = sum(!is.na(phq2_posneg_recorded)),
+
+    # PHQ-9 comparisons
+    phq9_manual_present = sum(!is.na(manual_phq9_score)),
+    phq9_reported_present = sum(!is.na(phq9_total_score_reported)),
+    phq9_both_manual_and_reported = sum(!is.na(manual_phq9_score) & !is.na(phq9_total_score_reported)),
+    phq9_only_manual = sum(!is.na(manual_phq9_score) & is.na(phq9_total_score_reported)),
+    phq9_only_reported = sum(is.na(manual_phq9_score) & !is.na(phq9_total_score_reported)),
+
+    phq9_posneg_present = sum(!is.na(phq9_posneg_recorded)),
+
+    phq9_all_items_present = sum(n_items_present == 9, na.rm = TRUE),
+
+    phq2_all_items_present = sum(phq2_num_items_present == 2, na.rm = TRUE)
+  ) %>%
+  # Convert summary row to long format
+  pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "count"
+  ) %>%
+  # Calculate percentage based on total_rows
+  mutate(
+    percentage = case_when(
+      metric == "total_rows" ~ 100,
+      TRUE ~ (count / count[metric == "total_rows"]) * 100
+    )
+  ) %>%
+  select(metric, count, percentage)
+
+print(comparison_summary)
+
+```
+
+so the biggest discrepancy is between the phq2 listed vs manual numeric scores. I want to check to see if the difference is due to some sort of double counting with the phq9s
+
+```{r}
+library(dplyr)
+
+# Add flags for presence
+phq_overlap <- result_wide %>%
+  mutate(
+    manual_phq2_present = !is.na(rowSums(across(all_of(c(
+      "phq_value_num_feeling down, depressed, or hopeless score",
+      "phq_value_num_little interest or pleasure in doing things score"
+    ))), na.rm = FALSE)),
+    reported_phq2_present = !is.na(`phq_value_num_PHQ-2 score`),
+    manual_phq9_present = !is.na(phq9_manual_sum),
+    reported_phq9_present = !is.na(`phq_value_num_PHQ-9 Total Score`)
+  ) %>%
+  summarise(
+    total = n(),
+    manual_phq2_only = sum(manual_phq2_present & !reported_phq2_present),
+    manual_phq2_and_reported_phq2 = sum(manual_phq2_present & reported_phq2_present),
+    manual_phq2_and_phq9 = sum(manual_phq2_present & manual_phq9_present),
+    manual_phq2_only_no_phq9 = sum(manual_phq2_present & !reported_phq2_present & !manual_phq9_present),
+    manual_phq2_only_with_phq9 = sum(manual_phq2_present & !reported_phq2_present & manual_phq9_present)
+  )
+
+print(phq_overlap)
+
+```
+
+majority of manual only phq2 scores also have a manual phq ***** come back to this 
+
+
+Load datasets:
+ - demo_data (unique patients)
+ - depression_data (PHQ screening)
+ - encounters_data (clinical encounters)
+  |
+  v
+Clean MRNs in all datasets (trim, convert to character)
+  |
+  v
+Merge demo_data + depression_data by MRN (mrn_deid)
+  |
+  v
+Convert PHQ screening dates and encounter dates to Date class
+  |
+  v
+Define ±1 month time window around each PHQ screening date
+  |
+  v
+For each encounter date (enc_date):
+  - Find PHQ screenings for same MRN
+  - Where encounter date falls within ±1 month of PHQ screening date
+  (Interval join using foverlaps)
+  |
+  v
+Keep only the PHQ screening **closest in time** to each encounter date
+  |
+  v
+Separate PHQ-2 positive screens:
+  - Filter PHQ-2 POS/NEG == "Positive"
+  - Define window: PHQ-2 date → PHQ-2 date + 14 days
+  |
+  v
+Filter PHQ-9 Total Scores
+  |
+  v
+Join PHQ-9 scores with PHQ-2 positive screens where PHQ-9 date falls within 14 days after PHQ-2 positive
+  (Interval join using foverlaps)
+  |
+  v
+Final dataset:
+  - One row per patient encounter
+  - With closest PHQ screen date & result
+  - PHQ-2 positive screens linked with follow-up PHQ-9 scores (if any)
+
+
+
+
+

@@ -1,0 +1,121 @@
+```{r}
+
+# Load necessary libraries
+library(data.table)
+library(ggplot2)
+library(epitools)
+
+# --- Configuration: Set your data path here ---
+# IMPORTANT: Change this path to the folder where your processed .rds files are saved.
+data_path <- "Z:/Kucirek/"
+
+# --- Step 1: Load Pre-processed Data ---
+result_wide_derm_clean <- readRDS(file.path(data_path, "result_wide_derm_clean.rds"))
+result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
+
+# Ensure they are data.tables
+setDT(result_wide_derm_clean)
+setDT(result_wide)
+
+
+# --- Step 2: Derm PHQ Summaries (data.table version) ---
+derm_phq_summary_dt <- result_wide_derm_clean[, .(
+    n_PHQ2 = sum(!is.na(`phq_value_num_PHQ-2 score`)),
+    mean_PHQ2 = mean(`phq_value_num_PHQ-2 score`, na.rm=TRUE),
+    n_PHQ2_manual = sum(!is.na(phq2_manual_sum)),
+    mean_PHQ2_manual = mean(phq2_manual_sum, na.rm=TRUE),
+    n_PHQ9 = sum(!is.na(`phq_value_num_PHQ-9 Total Score`)),
+    mean_PHQ9 = mean(`phq_value_num_PHQ-9 Total Score`, na.rm=TRUE),
+    n_PHQ9_manual = sum(!is.na(phq9_manual_sum)),
+    mean_PHQ9_manual = mean(phq9_manual_sum, na.rm=TRUE),
+    n_PHQ2_POS = sum(`phq_value_CMS PHQ-2 POS/NEG` == "Positive", na.rm=TRUE),
+    n_PHQ2_NEG = sum(`phq_value_CMS PHQ-2 POS/NEG` == "Negative", na.rm=TRUE),
+    n_PHQ9_POS = sum(`phq_value_CMS PHQ-9 POS/NEG` == "Positive", na.rm=TRUE),
+    n_PHQ9_NEG = sum(`phq_value_CMS PHQ-9 POS/NEG` == "Negative", na.rm=TRUE)
+)]
+print("Derm PHQ Summary:")
+print(derm_phq_summary_dt)
+
+
+# --- Step 3: Patient-Level Positivity Calculations (data.table) ---
+
+# PHQ-2 Positive Patients (Derm)
+phq2_positive_patients_derm <- result_wide_derm_clean[, 
+    .(ever_phq2_positive = any((`phq_value_CMS PHQ-2 POS/NEG` == "Positive") | (phq2_manual_posneg == "Positive"), na.rm = TRUE)),
+    by = mrn_deid
+]
+
+# PHQ-9 Positive Patients (Derm)
+phq9_positive_patients_derm <- result_wide_derm_clean[, 
+    .(ever_phq9_positive = any(("Positive" == `phq_value_CMS PHQ-9 POS/NEG`) |
+                               (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) |
+                               (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)),
+    by = mrn_deid
+]
+
+# Merge and cross-tabulate
+patient_overlap_derm <- merge(phq2_positive_patients_derm, phq9_positive_patients_derm, by = "mrn_deid", all = TRUE)
+cat("\n--- Derm Patient PHQ-2 vs PHQ-9 Overlap ---\n")
+print(table(Positive_PHQ2 = patient_overlap_derm$ever_phq2_positive, Positive_PHQ9 = patient_overlap_derm$ever_phq9_positive, useNA="ifany"))
+
+
+# --- Step 4: Comparison with Non-Derm Cohort (data.table) ---
+
+# Get vector of derm patient MRNs
+mrn_derm <- unique(result_wide_derm_clean$mrn_deid)
+
+# Filter to "non-derm" patients
+result_wide_nonderm <- result_wide[!(mrn_deid %in% mrn_derm)]
+
+# PHQ-2 Positive Patients (Non-Derm)
+phq2_positive_patients_nonderm <- result_wide_nonderm[, 
+    .(ever_phq2_positive = any((`phq_value_CMS PHQ-2 POS/NEG` == "Positive") | (phq2_manual_posneg == "Positive"), na.rm = TRUE)),
+    by = mrn_deid
+]
+
+# PHQ-9 Positive Patients (Non-Derm)
+phq9_positive_patients_nonderm <- result_wide_nonderm[, 
+    .(ever_phq9_positive = any(("Positive" == `phq_value_CMS PHQ-9 POS/NEG`) |
+                               (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) |
+                               (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)),
+    by = mrn_deid
+]
+
+# Get counts for statistical tests
+n_derm <- uniqueN(result_wide_derm_clean$mrn_deid)
+phq2_pos_derm <- sum(phq2_positive_patients_derm$ever_phq2_positive)
+phq9_pos_derm <- sum(phq9_positive_patients_derm$ever_phq9_positive)
+
+n_nonderm <- uniqueN(result_wide_nonderm$mrn_deid)
+phq2_pos_nonderm <- sum(phq2_positive_patients_nonderm$ever_phq2_positive)
+phq9_pos_nonderm <- sum(phq9_positive_patients_nonderm$ever_phq9_positive)
+
+# Construct 2x2 table for PHQ-2
+phq2_tab <- matrix(
+  c(phq2_pos_derm, n_derm - phq2_pos_derm,
+    phq2_pos_nonderm, n_nonderm - phq2_pos_nonderm),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(cohort = c("Derm", "Non-Derm"), PHQ2 = c("Positive", "Negative"))
+)
+
+# Construct 2x2 table for PHQ-9
+phq9_tab <- matrix(
+  c(phq9_pos_derm, n_derm - phq9_pos_derm,
+    phq9_pos_nonderm, n_nonderm - phq9_pos_nonderm),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(cohort = c("Derm", "Non-Derm"), PHQ9 = c("Positive", "Negative"))
+)
+
+# --- Step 5: Run Statistical Tests and Print Results ---
+cat("\n--- PHQ-2 Comparison: Derm vs. Non-Derm ---\n")
+print(phq2_tab)
+print(chisq.test(phq2_tab))
+print(oddsratio(phq2_tab))
+
+cat("\n--- PHQ-9 Comparison: Derm vs. Non-Derm ---\n")
+print(phq9_tab)
+print(chisq.test(phq9_tab))
+print(oddsratio(phq9_tab))
+```
+
+

@@ -1,0 +1,581 @@
+
+comparing black vs white in derm cohort, against each other and against all 
+
+```{r}
+# --- Package Management ---
+# This section checks for required packages and installs them if they are not already present.
+required_packages <- c("data.table", "dplyr", "gt", "scales", "epitools")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# --- Configuration: Set your data path here ---
+# IMPORTANT: Change this path to the folder where your processed .rds files are saved.
+data_path <- "Z:/Kucirek/"
+
+# --- Step 1: Load Pre-processed Data ---
+# Minimal re-creation of patient_summary for this script to run independently if needed
+result_wide_derm_clean <- readRDS(file.path(data_path, "result_wide_derm_clean.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+setDT(result_wide_derm_clean)
+setDT(result_info)
+result_info_subset <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)]
+derm_data_with_demo <- merge(result_wide_derm_clean, result_info_subset, by = "mrn_deid", all.x = TRUE)
+patient_summary <- derm_data_with_demo[, .(
+  age_at_encounter = first(age_at_encounter.y),
+  sex = first(sex),
+  race_refined = first(race_refined),
+  ethnic_refined = first(ethnic_refined),
+  fin_class = first(fin_class.y),
+  ever_phq2_positive = any(("Positive" == `phq_value_CMS PHQ-2 POS/NEG`) | (phq2_manual_posneg == "Positive"), na.rm = TRUE),
+  ever_phq9_positive = any(("Positive" == `phq_value_CMS PHQ-9 POS/NEG`) | 
+                             (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) | 
+                             (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)
+), by = mrn_deid]
+
+# --- Step 2: Define Race Levels and Prepare Overall Data ---
+
+# Ensure race_refined is a factor for proper table creation
+patient_summary$race_refined <- as.factor(patient_summary$race_refined)
+
+# Define the specific race levels to compare
+selected_race_levels <- c("Black or African American", "White")
+
+# Filter patient_summary to only include these levels for pairwise comparisons among them
+patient_summary_filtered <- patient_summary %>% 
+  filter(race_refined %in% selected_race_levels) %>% 
+  droplevels() # Drop unused levels from factor
+
+# Get all unique levels of the filtered race_refined
+filtered_race_levels <- levels(patient_summary_filtered$race_refined)
+
+# Calculate overall population counts for comparison
+overall_phq2_pos <- sum(patient_summary$ever_phq2_positive, na.rm = TRUE)
+overall_phq2_neg <- sum(!patient_summary$ever_phq2_positive, na.rm = TRUE)
+overall_phq9_pos <- sum(patient_summary$ever_phq9_positive, na.rm = TRUE)
+overall_phq9_neg <- sum(!patient_summary$ever_phq9_positive, na.rm = TRUE)
+
+# Initialize lists to store results for PHQ-2 and PHQ-9
+phq2_results <- list()
+phq9_results <- list()
+
+# --- Step 3: Perform Pairwise Comparisons and Collect Metrics ---
+
+k <- 1 # Counter for results list
+
+# Part 1: Pairwise comparisons among the selected race categories
+for (i in 1:(length(filtered_race_levels) - 1)) {
+  for (j in (i + 1):length(filtered_race_levels)) {
+    level1 <- filtered_race_levels[i]
+    level2 <- filtered_race_levels[j]
+    
+    # Subset data for these two levels
+    subset_data <- patient_summary_filtered %>% 
+      filter(race_refined %in% c(level1, level2))
+    
+    # Skip if subset_data is empty or has only one level
+    if (n_distinct(subset_data$race_refined) < 2) next
+
+    # --- PHQ-2 --- 
+    phq2_table <- table(subset_data$race_refined, subset_data$ever_phq2_positive)
+    # Ensure table has both TRUE/FALSE columns, even if one is zero
+    if (!"TRUE" %in% colnames(phq2_table)) phq2_table <- cbind(phq2_table, "TRUE" = 0)
+    if (!"FALSE" %in% colnames(phq2_table)) phq2_table <- cbind(phq2_table, "FALSE" = 0)
+    phq2_table <- phq2_table[, c("FALSE", "TRUE")] # Ensure consistent order
+    phq2_table_matrix <- as.matrix(phq2_table) # Explicitly convert to matrix
+
+    phq2_prop1 <- phq2_table[level1, "TRUE"] / sum(phq2_table[level1, ])
+    phq2_prop2 <- phq2_table[level2, "TRUE"] / sum(phq2_table[level2, ])
+    
+    # --- PHQ-9 --- 
+    phq9_table <- table(subset_data$race_refined, subset_data$ever_phq9_positive)
+    # Ensure table has both TRUE/FALSE columns, even if one is zero
+    if (!"TRUE" %in% colnames(phq9_table)) phq9_table <- cbind(phq9_table, "TRUE" = 0)
+    if (!"FALSE" %in% colnames(phq9_table)) phq9_table <- cbind(phq9_table, "FALSE" = 0)
+    phq9_table <- phq9_table[, c("FALSE", "TRUE")] # Ensure consistent order
+    phq9_table_matrix <- as.matrix(phq9_table) # Explicitly convert to matrix
+
+    phq9_prop1 <- phq9_table[level1, "TRUE"] / sum(phq9_table[level1, ])
+    phq9_prop2 <- phq9_table[level2, "TRUE"] / sum(phq9_table[level2, ])
+
+    # Store results
+    phq2_results[[k]] <- data.frame(
+      Comparison = paste0(level1, " vs. ", level2),
+      Group1 = level1,
+      Group2 = level2,
+      N1 = sum(phq2_table[level1, ]),
+      N2 = sum(phq2_table[level2, ]),
+      Pos1 = phq2_table[level1, "TRUE"],
+      Pos2 = phq2_table[level2, "TRUE"],
+      Prop1 = phq2_prop1,
+      Prop2 = phq2_prop2,
+      p_value = tryCatch(fisher.test(phq2_table_matrix)$p.value, error = function(e) NA) # Raw p-value for Bonferroni
+    )
+    
+    phq9_results[[k]] <- data.frame(
+      Comparison = paste0(level1, " vs. ", level2),
+      Group1 = level1,
+      Group2 = level2,
+      N1 = sum(phq9_table[level1, ]),
+      N2 = sum(phq9_table[level2, ]),
+      Pos1 = phq9_table[level1, "TRUE"],
+      Pos2 = phq9_table[level2, "TRUE"],
+      Prop1 = phq9_prop1,
+      Prop2 = phq9_prop2,
+      p_value = tryCatch(fisher.test(phq9_table_matrix)$p.value, error = function(e) NA) # Raw p-value for Bonferroni
+    )
+    
+    k <- k + 1
+  }
+}
+
+# Part 2: Comparison of each selected race category against the overall population
+for (level in filtered_race_levels) {
+  # Get counts for the specific level
+  level_data <- patient_summary %>% filter(race_refined == level)
+  level_phq2_pos <- sum(level_data$ever_phq2_positive, na.rm = TRUE)
+  level_phq2_neg <- sum(!level_data$ever_phq2_positive, na.rm = TRUE)
+  level_phq9_pos <- sum(level_data$ever_phq9_positive, na.rm = TRUE)
+  level_phq9_neg <- sum(!level_data$ever_phq9_positive, na.rm = TRUE)
+
+  # Construct 2x2 table for comparison against overall population
+  # PHQ-2
+  phq2_overall_table_matrix <- matrix(c(level_phq2_neg, level_phq2_pos,
+                                        overall_phq2_neg, overall_phq2_pos),
+                                      nrow = 2, byrow = TRUE,
+                                      dimnames = list(c(level, "Overall"), c("FALSE", "TRUE")))
+  
+  # PHQ-9
+  phq9_overall_table_matrix <- matrix(c(level_phq9_neg, level_phq9_pos,
+                                        overall_phq9_neg, overall_phq9_pos),
+                                      nrow = 2, byrow = TRUE,
+                                      dimnames = list(c(level, "Overall"), c("FALSE", "TRUE")))
+  
+  # Calculate proportions for display
+  prop_level_phq2 <- level_phq2_pos / (level_phq2_pos + level_phq2_neg)
+  prop_overall_phq2 <- overall_phq2_pos / (overall_phq2_pos + overall_phq2_neg)
+  prop_level_phq9 <- level_phq9_pos / (level_phq9_pos + level_phq9_neg)
+  prop_overall_phq9 <- overall_phq9_pos / (overall_phq9_pos + overall_phq9_neg)
+
+  p_val_phq2_overall <- tryCatch(chisq.test(phq2_overall_table_matrix)$p.value, error = function(e) NA)
+  p_val_phq9_overall <- tryCatch(chisq.test(phq9_overall_table_matrix)$p.value, error = function(e) NA)
+
+  # Store results
+  phq2_results[[k]] <- data.frame(
+    Comparison = paste0(level, " vs. Overall"),
+    Group1 = level,
+    Group2 = "Overall",
+    N1 = level_phq2_pos + level_phq2_neg,
+    N2 = overall_phq2_pos + overall_phq2_neg,
+    Pos1 = level_phq2_pos,
+    Pos2 = overall_phq2_pos,
+    Prop1 = prop_level_phq2,
+    Prop2 = prop_overall_phq2,
+    p_value = p_val_phq2_overall
+  )
+  
+  phq9_results[[k]] <- data.frame(
+    Comparison = paste0(level, " vs. Overall"),
+    Group1 = level,
+    Group2 = "Overall",
+    N1 = level_phq9_pos + level_phq9_neg,
+    N2 = overall_phq9_pos + overall_phq9_neg,
+    Pos1 = level_phq9_pos,
+    Pos2 = overall_phq9_pos,
+    Prop1 = prop_level_phq9,
+    Prop2 = prop_overall_phq9,
+    p_value = p_val_phq9_overall
+  )
+  
+  k <- k + 1
+}
+
+# Combine all results into data frames
+phq2_df <- bind_rows(phq2_results)
+phq9_df <- bind_rows(phq9_results)
+
+# --- Step 4: Apply Bonferroni Correction ---
+# Apply Bonferroni correction to all p-values collected
+phq2_df$p_adjusted <- p.adjust(phq2_df$p_value, method = "bonferroni")
+phq9_df$p_adjusted <- p.adjust(phq9_df$p_value, method = "bonferroni")
+
+# --- Step 5: Format for gt Table and Create Publication-Ready Table ---
+
+# Format PHQ-2 results
+phq2_formatted <- phq2_df %>% 
+  mutate(
+    Group1_Stats = paste0(Pos1, " / ", N1, " (", scales::percent(Prop1, accuracy = 0.1), ")"),
+    Group2_Stats = paste0(Pos2, " / ", N2, " (", scales::percent(Prop2, accuracy = 0.1), ")"),
+    p_value_display = scales::pvalue(p_adjusted, accuracy = 0.001)
+  ) %>% 
+  select(Comparison, Group1, Group1_Stats, Group2, Group2_Stats, p_value_display)
+
+# Format PHQ-9 results
+phq9_formatted <- phq9_df %>% 
+  mutate(
+    Group1_Stats = paste0(Pos1, " / ", N1, " (", scales::percent(Prop1, accuracy = 0.1), ")"),
+    Group2_Stats = paste0(Pos2, " / ", N2, " (", scales::percent(Prop2, accuracy = 0.1), ")"),
+    p_value_display = scales::pvalue(p_adjusted, accuracy = 0.001)
+  ) %>% 
+  select(Comparison, Group1, Group1_Stats, Group2, Group2_Stats, p_value_display)
+
+
+# Create gt tables
+
+# PHQ-2 Table
+gt_phq2_race <- phq2_formatted %>% 
+  gt() %>% 
+  cols_label(
+    Comparison = "Comparison",
+    Group1 = "Group 1",
+    Group1_Stats = "Positive (n/N, %)",
+    Group2 = "Group 2",
+    Group2_Stats = "Positive (n/N, %)",
+    p_value_display = "Adj. p-value"
+  ) %>% 
+  tab_header(title = "Pairwise Comparisons of PHQ-2 Positivity by Race") %>% 
+  tab_spanner(label = "Group 1", columns = c(Group1, Group1_Stats)) %>% 
+  tab_spanner(label = "Group 2", columns = c(Group2, Group2_Stats)) %>% 
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(3),
+    column_labels.font.weight = "bold"
+  )
+
+# PHQ-9 Table
+gt_phq9_race <- phq9_formatted %>% 
+  gt() %>% 
+  cols_label(
+    Comparison = "Comparison",
+    Group1 = "Group 1",
+    Group1_Stats = "Positive (n/N, %)",
+    Group2 = "Group 2",
+    Group2_Stats = "Positive (n/N, %)",
+    p_value_display = "Adj. p-value"
+  ) %>% 
+  tab_header(title = "Pairwise Comparisons of PHQ-9 Positivity by Race") %>% 
+  tab_spanner(label = "Group 1", columns = c(Group1, Group1_Stats)) %>% 
+  tab_spanner(label = "Group 2", columns = c(Group2, Group2_Stats)) %>% 
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(3),
+    column_labels.font.weight = "bold"
+  )
+
+# Print tables
+print(gt_phq2_race)
+print(gt_phq9_race)
+
+# To save tables:
+# gtsave(gt_phq2_race, "race_pairwise_phq2_positivity.html")
+# gtsave(gt_phq9_race, "race_pairwise_phq9_positivity.html")
+```
+
+
+```{r}
+# --- Package Management ---
+# This section checks for required packages and installs them if they are not already present.
+required_packages <- c("data.table", "dplyr", "gt", "scales", "epitools")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# --- Configuration: Set your data path here ---
+# IMPORTANT: Change this path to the folder where your processed .rds files are saved.
+data_path <- "Z:/Kucirek/"
+
+# --- Step 1: Load Pre-processed Data ---
+# Minimal re-creation of patient_summary for this script to run independently if needed
+result_wide_derm_clean <- readRDS(file.path(data_path, "result_wide_derm_clean.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+setDT(result_wide_derm_clean)
+setDT(result_info)
+result_info_subset <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)]
+derm_data_with_demo <- merge(result_wide_derm_clean, result_info_subset, by = "mrn_deid", all.x = TRUE)
+patient_summary <- derm_data_with_demo[, .(
+  age_at_encounter = first(age_at_encounter.y),
+  sex = first(sex),
+  race_refined = first(race_refined),
+  ethnic_refined = first(ethnic_refined),
+  fin_class = first(fin_class.y),
+  ever_phq2_positive = any(("Positive" == `phq_value_CMS PHQ-2 POS/NEG`) | (phq2_manual_posneg == "Positive"), na.rm = TRUE),
+  ever_phq9_positive = any(("Positive" == `phq_value_CMS PHQ-9 POS/NEG`) | 
+                             (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) | 
+                             (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)
+), by = mrn_deid]
+
+# --- Step 2: Prepare Data for Pairwise Comparisons ---
+
+# Ensure fin_class is a factor for proper table creation
+patient_summary$fin_class <- as.factor(patient_summary$fin_class)
+
+# Get all unique levels of fin_class
+fin_class_levels <- levels(patient_summary$fin_class)
+
+# Initialize a list to store results for PHQ-2 and PHQ-9
+phq2_results <- list()
+phq9_results <- list()
+
+# --- Step 3: Perform Pairwise Comparisons and Collect Metrics ---
+
+k <- 1 # Counter for results list
+for (i in 1:(length(fin_class_levels) - 1)) {
+  for (j in (i + 1):length(fin_class_levels)) {
+    level1 <- fin_class_levels[i]
+    level2 <- fin_class_levels[j]
+    
+    # Subset data for these two levels
+    subset_data <- patient_summary %>% 
+      filter(fin_class %in% c(level1, level2))
+    
+    # Skip if subset_data is empty or has only one level
+    if (n_distinct(subset_data$fin_class) < 2) next
+
+    # --- PHQ-2 --- 
+    phq2_table <- table(subset_data$fin_class, subset_data$ever_phq2_positive)
+    # Ensure table has both TRUE/FALSE columns, even if one is zero
+    if (!"TRUE" %in% colnames(phq2_table)) phq2_table <- cbind(phq2_table, "TRUE" = 0)
+    if (!"FALSE" %in% colnames(phq2_table)) phq2_table <- cbind(phq2_table, "FALSE" = 0)
+    phq2_table <- phq2_table[, c("FALSE", "TRUE")] # Ensure consistent order
+
+    phq2_prop1 <- phq2_table[level1, "TRUE"] / sum(phq2_table[level1, ])
+    phq2_prop2 <- phq2_table[level2, "TRUE"] / sum(phq2_table[level2, ])
+
+    phq2_p_value <- NA
+    if (phq2_table[level1, "TRUE"] >= 40 && phq2_table[level2, "TRUE"] >= 40) {
+      phq2_p_value <- tryCatch(fisher.test(as.matrix(phq2_table))$p.value, error = function(e) NA)
+    }
+
+    # --- PHQ-9 --- 
+    phq9_table <- table(subset_data$fin_class, subset_data$ever_phq9_positive)
+    # Ensure table has both TRUE/FALSE columns, even if one is zero
+    if (!"TRUE" %in% colnames(phq9_table)) phq9_table <- cbind(phq9_table, "TRUE" = 0)
+    if (!"FALSE" %in% colnames(phq9_table)) phq9_table <- cbind(phq9_table, "FALSE" = 0)
+    phq9_table <- phq9_table[, c("FALSE", "TRUE")] # Ensure consistent order
+
+    phq9_prop1 <- phq9_table[level1, "TRUE"] / sum(phq9_table[level1, ])
+    phq9_prop2 <- phq9_table[level2, "TRUE"] / sum(phq9_table[level2, ])
+
+    phq9_p_value <- NA
+    if (phq9_table[level1, "TRUE"] >= 40 && phq9_table[level2, "TRUE"] >= 40) {
+      phq9_p_value <- tryCatch(fisher.test(as.matrix(phq9_table))$p.value, error = function(e) NA)
+    }
+
+    # Store results
+    if (phq2_table[level1, "TRUE"] >= 40 && phq2_table[level2, "TRUE"] >= 40) {
+      phq2_results <- c(phq2_results, list(data.frame(
+        Comparison = paste0(level1, " vs. ", level2),
+        Group1 = level1,
+        Group2 = level2,
+        N1 = sum(phq2_table[level1, ]),
+        N2 = sum(phq2_table[level2, ]),
+        Pos1 = phq2_table[level1, "TRUE"],
+        Pos2 = phq2_table[level2, "TRUE"],
+        Prop1 = phq2_prop1,
+        Prop2 = phq2_prop2,
+        p_value = phq2_p_value # Raw p-value for Bonferroni
+      )))
+    }
+    
+    if (phq9_table[level1, "TRUE"] >= 40 && phq9_table[level2, "TRUE"] >= 40) {
+      phq9_results <- c(phq9_results, list(data.frame(
+        Comparison = paste0(level1, " vs. ", level2),
+        Group1 = level1,
+        Group2 = level2,
+        N1 = sum(phq9_table[level1, ]),
+        N2 = sum(phq9_table[level2, ]),
+        Pos1 = phq9_table[level1, "TRUE"],
+        Pos2 = phq9_table[level2, "TRUE"],
+        Prop1 = phq9_prop1,
+        Prop2 = phq9_prop2,
+        p_value = phq9_p_value # Raw p-value for Bonferroni
+      )))
+    }
+  }
+}
+
+# Combine all results into data frames
+phq2_df <- bind_rows(phq2_results)
+phq9_df <- bind_rows(phq9_results)
+
+# Calculate overall population counts for comparison
+overall_phq2_pos <- sum(patient_summary$ever_phq2_positive, na.rm = TRUE)
+overall_phq2_neg <- sum(!patient_summary$ever_phq2_positive, na.rm = TRUE)
+overall_phq9_pos <- sum(patient_summary$ever_phq9_positive, na.rm = TRUE)
+overall_phq9_neg <- sum(!patient_summary$ever_phq9_positive, na.rm = TRUE)
+
+# Part 2: Comparison of each selected insurance category against the overall population
+for (level in fin_class_levels) {
+  # Get counts for the specific level
+  level_data <- patient_summary %>% filter(fin_class == level)
+  level_phq2_pos <- sum(level_data$ever_phq2_positive, na.rm = TRUE)
+  level_phq2_neg <- sum(!level_data$ever_phq2_positive, na.rm = TRUE)
+  level_phq9_pos <- sum(level_data$ever_phq9_positive, na.rm = TRUE)
+  level_phq9_neg <- sum(!level_data$ever_phq9_positive, na.rm = TRUE)
+
+  # Construct 2x2 table for comparison against overall population
+  # PHQ-2
+  phq2_overall_table_matrix <- matrix(c(level_phq2_neg, level_phq2_pos,
+                                        overall_phq2_neg, overall_phq2_pos),
+                                      nrow = 2, byrow = TRUE,
+                                      dimnames = list(c(level, "Overall"), c("FALSE", "TRUE")))
+  
+  # PHQ-9
+  phq9_overall_table_matrix <- matrix(c(level_phq9_neg, level_phq9_pos,
+                                        overall_phq9_neg, overall_phq9_pos),
+                                      nrow = 2, byrow = TRUE,
+                                      dimnames = list(c(level, "Overall"), c("FALSE", "TRUE")))
+  
+  # Calculate proportions for display
+  prop_level_phq2 <- level_phq2_pos / (level_phq2_pos + level_phq2_neg)
+  prop_overall_phq2 <- overall_phq2_pos / (overall_phq2_pos + overall_phq2_neg)
+  prop_level_phq9 <- level_phq9_pos / (level_phq9_pos + level_phq9_neg)
+  prop_overall_phq9 <- overall_phq9_pos / (overall_phq9_pos + overall_phq9_neg)
+
+  p_val_phq2_overall <- NA
+  if (level_phq2_pos >= 40 && overall_phq2_pos >= 40) {
+    p_val_phq2_overall <- tryCatch(chisq.test(phq2_overall_table_matrix)$p.value, error = function(e) NA)
+  }
+
+  p_val_phq9_overall <- NA
+  if (level_phq9_pos >= 40 && overall_phq9_pos >= 40) {
+    p_val_phq9_overall <- tryCatch(chisq.test(phq9_overall_table_matrix)$p.value, error = function(e) NA)
+  }
+
+  # Store results
+  if (level_phq2_pos >= 40 && overall_phq2_pos >= 40) {
+    phq2_results <- c(phq2_results, list(data.frame(
+      Comparison = paste0(level, " vs. Overall"),
+      Group1 = level,
+      Group2 = "Overall",
+      N1 = level_phq2_pos + level_phq2_neg,
+      N2 = overall_phq2_pos + overall_phq2_neg,
+      Pos1 = level_phq2_pos,
+      Pos2 = overall_phq2_pos,
+      Prop1 = prop_level_phq2,
+      Prop2 = prop_overall_phq2,
+      p_value = p_val_phq2_overall
+    )))
+  }
+  
+  if (level_phq9_pos >= 40 && overall_phq9_pos >= 40) {
+    phq9_results <- c(phq9_results, list(data.frame(
+      Comparison = paste0(level, " vs. Overall"),
+      Group1 = level,
+      Group2 = "Overall",
+      N1 = level_phq9_pos + level_phq9_neg,
+      N2 = overall_phq9_pos + overall_phq9_neg,
+      Pos1 = level_phq9_pos,
+      Pos2 = overall_phq9_pos,
+      Prop1 = prop_level_phq9,
+      Prop2 = prop_overall_phq9,
+      p_value = p_val_phq9_overall
+    )))
+  }
+}
+}
+
+# Combine all results into data frames
+
+# --- Step 4: Apply Bonferroni Correction ---
+phq2_df$p_adjusted <- p.adjust(phq2_df$p_value, method = "bonferroni")
+phq9_df$p_adjusted <- p.adjust(phq9_df$p_value, method = "bonferroni")
+
+# --- Step 5: Format for gt Table and Create Publication-Ready Table ---
+
+# Function to format OR (CI) string
+format_or_ci <- function(or, lower, upper) {
+  if (is.na(or) || is.na(lower) || is.na(upper)) {
+    return(NA_character_)
+  } else {
+    return(sprintf("%.2f (%.2f, %.2f)", or, lower, upper))
+  }
+}
+
+# Format PHQ-2 results
+phq2_formatted <- phq2_df %>% 
+  mutate(
+    Prop1_calc = Pos1 / N1,
+    Prop2_calc = Pos2 / N2,
+    Group1_Stats = paste0(Pos1, " / ", N1, " (", scales::percent(Prop1_calc, accuracy = 0.1), ")"),
+    Group2_Stats = paste0(Pos2, " / ", N2, " (", scales::percent(Prop2_calc, accuracy = 0.1), ")"),
+    p_value_display = scales::pvalue(p_adjusted, accuracy = 0.001)
+  ) %>% 
+  select(Comparison, Group1, Group1_Stats, Group2, Group2_Stats, p_value_display)
+
+# Format PHQ-9 results
+phq9_formatted <- phq9_df %>% 
+  mutate(
+    Prop1_calc = Pos1 / N1,
+    Prop2_calc = Pos2 / N2,
+    Group1_Stats = paste0(Pos1, " / ", N1, " (", scales::percent(Prop1_calc, accuracy = 0.1), ")"),
+    Group2_Stats = paste0(Pos2, " / ", N2, " (", scales::percent(Prop2_calc, accuracy = 0.1), ")"),
+    p_value_display = scales::pvalue(p_adjusted, accuracy = 0.001)
+  ) %>% 
+  select(Comparison, Group1, Group1_Stats, Group2, Group2_Stats, p_value_display)
+
+
+# Create gt tables
+
+# PHQ-2 Table
+gt_phq2_fin_class <- phq2_formatted %>% 
+  gt() %>% 
+  cols_label(
+    Comparison = "Comparison",
+    Group1 = "Group 1",
+    Group1_Stats = "Positive (n/N, %)",
+    Group2 = "Group 2",
+    Group2_Stats = "Positive (n/N, %)",
+    p_value_display = "Adj. p-value"
+  ) %>% 
+  tab_header(title = "Pairwise Comparisons of PHQ-2 Positivity by Insurance Class") %>% 
+  tab_spanner(label = "Group 1", columns = c(Group1, Group1_Stats)) %>% 
+  tab_spanner(label = "Group 2", columns = c(Group2, Group2_Stats)) %>% 
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(3),
+    column_labels.font.weight = "bold"
+  )
+
+# PHQ-9 Table
+gt_phq9_fin_class <- phq9_formatted %>% 
+  gt() %>% 
+  cols_label(
+    Comparison = "Comparison",
+    Group1 = "Group 1",
+    Group1_Stats = "Positive (n/N, %)",
+    Group2 = "Group 2",
+    Group2_Stats = "Positive (n/N, %)",
+    p_value_display = "Adj. p-value"
+  ) %>% 
+  tab_header(title = "Pairwise Comparisons of PHQ-9 Positivity by Insurance Class") %>% 
+  tab_spanner(label = "Group 1", columns = c(Group1, Group1_Stats)) %>% 
+  tab_spanner(label = "Group 2", columns = c(Group2, Group2_Stats)) %>% 
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(3),
+    column_labels.font.weight = "bold"
+  )
+
+# Print tables
+print(gt_phq2_fin_class)
+print(gt_phq9_fin_class)
+
+# To save tables:
+# gtsave(gt_phq2_fin_class, "insurance_pairwise_phq2_positivity.html")
+# gtsave(gt_phq9_fin_class, "insurance_pairwise_phq9_positivity.html")
+```
+
+
+
+
+
+
