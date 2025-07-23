@@ -17,7 +17,7 @@ result_wide[, mrn_deid := as.character(mrn_deid)] # Ensure mrn_deid is character
 # Load raw demo data (as it is needed to build result_info)
 # NOTE: This path should point to your original raw data file.
 demo_cols <- c("MRN_DEID", "race", "ethnic", "sex")
-demo_data <- fread("Z:/Kucirek/dr_592588_demo.csv", select = demo_cols)
+demo_data <- fread("Z:/Kucirek/Data(Do not touch!)/dr_592588_demo.csv", select = demo_cols)
 setnames(demo_data, tolower(names(demo_data)))
 setDT(demo_data)
 demo_data[, mrn_deid := as.character(mrn_deid)] # Ensure mrn_deid is character
