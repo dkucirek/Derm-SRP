@@ -1,0 +1,853 @@
+---
+title: "06: Individual Chronic Condition Propensity Score Matching Analysis"
+output: html_document
+---
+
+This script performs individual propensity score matching for each chronic dermatological condition against matched controls, creating before/after demographics tables for each condition.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(MatchIt)
+library(gt)
+library(scales)
+library(epitools)
+library(tibble)
+
+data_path <- "Z:/Kucirek/"
+
+result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+patient_data_for_matching <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
+
+setDT(result_wide_all)
+setDT(chronic_derm_cohort)
+setDT(patient_data_for_matching)
+
+# remove 'Unknown' sex category (34 in unmatched controls)
+patient_data_for_matching <- patient_data_for_matching[sex != "Unknown"]
+
+cat("=== INDIVIDUAL CONDITION PROPENSITY SCORE MATCHING ===\n")
+cat("Data loaded successfully\n")
+```
+
+### Define Chronic Conditions and Extract Condition-Specific Cohorts
+
+```{r}
+# define chronic dermatological conditions
+chronic_condition_icd_codes <- list(
+  "Scarring Alopecia" = "L66",
+  "Acne" = "L70", 
+  "Atopic Dermatitis" = "L20",
+  "Hidradenitis Suppurativa" = "L73.2",
+  "Rosacea" = "L71",
+  "Vitiligo" = "L80",
+  "Alopecia Areata" = "L63",
+  "Psoriasis" = "L40",
+  "Lupus Erythematosus" = c("L93", "M32.1", "M32.9")
+)
+
+# create condition-specific demographics table with SMDs
+create_condition_demographics_table <- function(before_data, after_data, condition_name, match_summary) {
+  
+  # helper function for summary statistics
+  summarize_covariate <- function(data, covariate_name, is_continuous = FALSE) {
+    if (is_continuous) {
+      mean_sd_control <- data[is_chronic_derm == FALSE, 
+                              paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                     round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+      mean_sd_treated <- data[is_chronic_derm == TRUE, 
+                              paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                     round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+      
+      return(data.frame(
+        Characteristic = covariate_name,
+        Level = "",
+        Control = mean_sd_control,
+        Treated = mean_sd_treated,
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      total_n_control <- nrow(data[is_chronic_derm == FALSE])
+      total_n_treated <- nrow(data[is_chronic_derm == TRUE])
+      
+      counts_control <- data[is_chronic_derm == FALSE, .N, by = get(covariate_name)]
+      setnames(counts_control, c("Level", "N"))
+      counts_control[, Display := paste0(N, " (", scales::percent(N / total_n_control, accuracy = 1), ")")]
+      
+      counts_treated <- data[is_chronic_derm == TRUE, .N, by = get(covariate_name)]
+      setnames(counts_treated, c("Level", "N"))
+      counts_treated[, Display := paste0(N, " (", scales::percent(N / total_n_treated, accuracy = 1), ")")]
+      
+      merged_counts <- full_join(counts_control %>% select(Level, Control = Display), 
+                                 counts_treated %>% select(Level, Treated = Display), 
+                                 by = "Level")
+      merged_counts[is.na(merged_counts)] <- "0 (0%)"
+      
+      # TRUE/FALSE to Yes/No for has_psych_condition
+      if (covariate_name == "has_psych_condition") {
+        merged_counts$Level <- recode(merged_counts$Level, `TRUE` = "Yes", `FALSE` = "No")
+      }
+      
+      return(data.frame(
+        Characteristic = covariate_name,
+        Level = merged_counts$Level,
+        Control = merged_counts$Control,
+        Treated = merged_counts$Treated,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # summaries for before and after matching
+  covariates_continuous <- c("age_at_encounter")
+  covariates_categorical <- c("sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
+  
+  # before matching summaries
+  summary_before_list <- list()
+  for (cov in covariates_continuous) {
+    summary_before_list[[cov]] <- summarize_covariate(before_data, cov, is_continuous = TRUE)
+  }
+  for (cov in covariates_categorical) {
+    summary_before_list[[cov]] <- summarize_covariate(before_data, cov, is_continuous = FALSE)
+  }
+  summary_before_df <- bind_rows(summary_before_list)
+  
+  # after matching summaries
+  summary_after_list <- list()
+  for (cov in covariates_continuous) {
+    summary_after_list[[cov]] <- summarize_covariate(after_data, cov, is_continuous = TRUE)
+  }
+  for (cov in covariates_categorical) {
+    summary_after_list[[cov]] <- summarize_covariate(after_data, cov, is_continuous = FALSE)
+  }
+  summary_after_df <- bind_rows(summary_after_list)
+  
+  # combine and format for gt 
+  setnames(summary_before_df, c("Control", "Treated"), c("Control_Before", "Treated_Before"))
+  setnames(summary_after_df, c("Control", "Treated"), c("Control_After", "Treated_After"))
+  
+  final_table_data <- full_join(summary_before_df, summary_after_df, by = c("Characteristic", "Level"))
+  
+  characteristic_order <- c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
+  final_table_data$Characteristic <- factor(final_table_data$Characteristic, levels = characteristic_order)
+  final_table_data <- final_table_data %>% arrange(Characteristic, Level)
+  
+  final_table_data$Characteristic <- recode(final_table_data$Characteristic,
+    age_at_encounter = "Age, mean (SD)",
+    sex = "Sex",
+    race_refined = "Race",
+    ethnic_refined = "Ethnicity",
+    fin_class = "Insurance Class",
+    has_psych_condition = "Prior Psych Care"
+  )
+  
+  final_table_data <- final_table_data %>% 
+    mutate(Characteristic = as.character(Characteristic)) %>% 
+    group_by(Characteristic) %>% 
+    mutate(Characteristic_Display = ifelse(row_number() == 1, Characteristic, "")) %>% 
+    ungroup()
+  
+  # get SMDs from match summary
+  library(tibble)
+  smd_before <- as.data.frame(match_summary$sum.all) %>%
+    rownames_to_column("Covariate") %>%
+    select(Covariate, SMD_Before = `Std. Mean Diff.`)
+  
+  smd_after <- as.data.frame(match_summary$sum.matched) %>%
+    rownames_to_column("Covariate") %>%
+    select(Covariate, SMD_After = `Std. Mean Diff.`)
+  
+  smd_table <- inner_join(smd_before, smd_after, by = "Covariate")
+  smd_table$SMD_Before <- round(abs(smd_table$SMD_Before), 3)
+  smd_table$SMD_After <- round(abs(smd_table$SMD_After), 3)
+  
+  # make mapping function to match MatchIt covariate names 
+  map_covariate_to_table <- function(covariate_name) {
+    if (covariate_name == "age_at_encounter") {
+      return(list(char = "Age, mean (SD)", level = ""))
+    } else if (grepl("^sex", covariate_name)) {
+      level <- gsub("^sex", "", covariate_name)
+      return(list(char = "Sex", level = level))
+    } else if (grepl("^race_refined", covariate_name)) {
+      level <- gsub("^race_refined", "", covariate_name)
+      return(list(char = "Race", level = level))
+    } else if (grepl("^ethnic_refined", covariate_name)) {
+      level <- gsub("^ethnic_refined", "", covariate_name)
+      return(list(char = "Ethnicity", level = level))
+    } else if (grepl("^fin_class", covariate_name)) {
+      level <- gsub("^fin_class", "", covariate_name)
+      return(list(char = "Insurance Class", level = level))
+    } else if (grepl("^has_psych_condition", covariate_name)) {
+      level <- gsub("^has_psych_condition", "", covariate_name)
+      level <- ifelse(level == "TRUE", "Yes", ifelse(level == "FALSE", "No", level))
+      return(list(char = "Prior Psych Care", level = level))
+    }
+    return(NULL)
+  }
+  
+  # add SMD columns to final table data
+  final_table_data$SMD_Before <- ""
+  final_table_data$SMD_After <- ""
+  
+  # map SMDs to all rows based on characteristic and level
+  for (i in 1:nrow(final_table_data)) {
+    char <- final_table_data$Characteristic[i]
+    level <- final_table_data$Level[i]
+    
+    # match SMD entries
+    for (j in 1:nrow(smd_table)) {
+      mapping <- map_covariate_to_table(smd_table$Covariate[j])
+      if (!is.null(mapping) && mapping$char == char && mapping$level == level) {
+        final_table_data$SMD_Before[i] <- as.character(smd_table$SMD_Before[j])
+        final_table_data$SMD_After[i] <- as.character(smd_table$SMD_After[j])
+        break
+      }
+    }
+  }
+  
+  # demographics table with SMDs
+  demo_table <- final_table_data %>% 
+    select(Characteristic_Display, Level, Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After) %>% 
+    gt() %>% 
+    cols_label(
+      Characteristic_Display = "Characteristic",
+      Level = "",
+      Control_Before = "Control",
+      Treated_Before = condition_name,
+      SMD_Before = "SMD",
+      Control_After = "Control", 
+      Treated_After = condition_name,
+      SMD_After = "SMD"
+    ) %>% 
+    tab_spanner(label = "Before Matching", columns = c(Control_Before, Treated_Before, SMD_Before)) %>% 
+    tab_spanner(label = "After Matching", columns = c(Control_After, Treated_After, SMD_After)) %>% 
+    tab_header(
+      title = paste("Demographics for", condition_name, "Before and After Propensity Score Matching"),
+      subtitle = "Values are n (%) unless otherwise specified"
+    ) %>% 
+    #  styling for readability
+    tab_style(
+      style = cell_text(indent = px(20), size = px(13)),
+      locations = cells_body(columns = Level, rows = Level != "")
+    ) %>% 
+    tab_style(
+      style = cell_text(weight = "bold", size = px(14)),
+      locations = cells_body(columns = Characteristic_Display, rows = Characteristic_Display != "")
+    ) %>%
+    #  alternate row shading 
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_body(rows = seq(2, nrow(final_table_data), 2))
+    ) %>%
+    cols_align(align = "left", columns = c(Characteristic_Display, Level)) %>% 
+    cols_align(align = "center", columns = c(Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After)) %>% 
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.top.width = px(3),
+      table.border.bottom.color = "#495057",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      column_labels.font.size = px(13),
+      table.font.size = px(13),
+      table.font.names = c("Calibri", "Segoe UI", "Helvetica", "Arial", "sans-serif"),
+      data_row.padding = px(8)
+    ) %>%
+    tab_footnote(
+      footnote = "SMD <0.1 indicates good balance; SMD >0.1 indicates potential imbalance. SMD = |mean_treated - mean_control| / pooled_SD for continuous variables, maximum category-specific SMD for categorical variables.",
+      locations = cells_column_labels(columns = SMD_Before)
+    ) %>%
+    tab_source_note(
+      source_note = paste("Propensity score matching performed using logistic regression with covariates: age, sex, race, ethnicity, insurance class, and prior psychiatric care for", condition_name, "patients.")
+    )
+  
+  return(demo_table)
+}
+
+# get condition-specific patient cohorts
+condition_cohorts <- list()
+
+for (condition_name in names(chronic_condition_icd_codes)) {
+  cat("\n=== PROCESSING", toupper(condition_name), "===\n")
+  
+  icd_codes <- chronic_condition_icd_codes[[condition_name]]
+  condition_pattern <- paste(icd_codes, collapse = "|")
+  
+  # get patients with this condition from chronic derm cohort
+  condition_patients <- chronic_derm_cohort[str_detect(icd10_dx, condition_pattern), unique(mrn_deid)]
+  
+  if (length(condition_patients) < 50) {
+    cat("Skipping", condition_name, "- insufficient patients (", length(condition_patients), ")\n")
+    next
+  }
+  
+  cat("Found", length(condition_patients), "patients with", condition_name, "\n")
+  
+  #  condition-specific dataset for matching
+  condition_data_for_matching <- copy(patient_data_for_matching)
+  condition_data_for_matching[, is_chronic_derm := mrn_deid %in% condition_patients]
+  
+  # store before matching data for demographics table
+  before_matching_data <- copy(condition_data_for_matching)
+  
+  # propensity score matching for this condition
+  patient_data_df <- as.data.frame(condition_data_for_matching)
+  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+  
+  cat("Performing propensity score matching for", condition_name, "...\n")
+  
+  tryCatch({
+    m_out <- matchit(
+      is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class + has_psych_condition,
+      data = patient_data_df,
+      method = "nearest",
+      distance = "glm",
+      caliper = 0.2,
+      replace = FALSE,
+      ratio = 20
+    )
+    
+    # extract matched data
+    matched_data_condition <- match.data(m_out)
+    matched_data_condition$treat <- m_out$treat[as.numeric(row.names(matched_data_condition))]
+    setDT(matched_data_condition)
+    
+    # store results
+    condition_cohorts[[condition_name]] <- list(
+      condition_patients = condition_patients,
+      before_matching = before_matching_data,
+      after_matching = matched_data_condition,
+      match_summary = summary(m_out)
+    )
+    
+    cat("Matching completed for", condition_name, "\n")
+    cat("Matched:", sum(matched_data_condition$treat == 1), condition_name, "patients\n")
+    cat("Matched:", sum(matched_data_condition$treat == 0), "control patients\n")
+    
+  }, error = function(e) {
+    cat("Error in matching for", condition_name, ":", e$message, "\n")
+  })
+}
+
+cat("\n=== MATCHING SUMMARY ===\n")
+cat("Successfully processed", length(condition_cohorts), "conditions\n")
+cat("Conditions:", paste(names(condition_cohorts), collapse = ", "), "\n")
+```
+
+### Create Demographics Tables for Each Condition
+
+```{r}
+# make demographics tables for each successfully matched condition
+for (condition_name in names(condition_cohorts)) {
+  cat("\n=== DEMOGRAPHICS TABLE FOR", toupper(condition_name), "===\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  
+  # Create and print demographics table
+  demo_table <- create_condition_demographics_table(
+    before_data = cohort_data$before_matching,
+    after_data = cohort_data$after_matching,
+    condition_name = condition_name,
+    match_summary = cohort_data$match_summary
+  )
+  
+  print(demo_table)
+  
+  # print matching summary
+  cat("\nMatching Summary for", condition_name, ":\n")
+  cat("Before matching -", condition_name, "patients:", sum(cohort_data$before_matching$is_chronic_derm), "\n")
+  cat("Before matching - Control patients:", sum(!cohort_data$before_matching$is_chronic_derm), "\n")
+  cat("After matching -", condition_name, "patients:", sum(cohort_data$after_matching$treat == 1), "\n")
+  cat("After matching - Control patients:", sum(cohort_data$after_matching$treat == 0), "\n")
+  
+  # balance assessment
+  balance_summary <- cohort_data$match_summary
+  cat("Balance Assessment:\n")
+  if (!is.null(balance_summary$sum.matched)) {
+    smd_after <- balance_summary$sum.matched[, "Std. Mean Diff."]
+    good_balance <- sum(abs(smd_after) < 0.1, na.rm = TRUE)
+    total_covariates <- length(smd_after)
+    cat("Covariates with good balance (SMD < 0.1):", good_balance, "out of", total_covariates, "\n")
+  }
+}
+```
+
+### Summary of Individual Condition Matching Results
+
+```{r}
+# comprehensive summary table
+summary_results <- data.table()
+
+for (condition_name in names(condition_cohorts)) {
+  cohort_data <- condition_cohorts[[condition_name]]
+  
+  summary_results <- rbind(summary_results, data.table(
+    Condition = condition_name,
+    Before_Condition_N = sum(cohort_data$before_matching$is_chronic_derm),
+    Before_Control_N = sum(!cohort_data$before_matching$is_chronic_derm),
+    After_Condition_N = sum(cohort_data$after_matching$treat == 1),
+    After_Control_N = sum(cohort_data$after_matching$treat == 0),
+    Match_Ratio = round(sum(cohort_data$after_matching$treat == 0) / sum(cohort_data$after_matching$treat == 1), 1)
+  ))
+}
+
+#  summary table
+summary_table <- summary_results %>%
+  gt() %>%
+  tab_header(
+    title = "Propensity Score Matching Summary by Chronic Dermatological Condition",
+    subtitle = "Before and after matching patient counts for each condition"
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    Before_Condition_N = "Condition Patients",
+    Before_Control_N = "Available Controls",
+    After_Condition_N = "Matched Condition",
+    After_Control_N = "Matched Controls",
+    Match_Ratio = "Final Ratio"
+  ) %>%
+  tab_spanner(label = "Before Matching", columns = c(Before_Condition_N, Before_Control_N)) %>%
+  tab_spanner(label = "After Matching", columns = c(After_Condition_N, After_Control_N, Match_Ratio)) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(summary_results), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(12),
+    table.font.names = c("Calibri", "Segoe UI", "Arial", "sans-serif")
+  ) %>%
+  tab_source_note(
+    source_note = "Each condition was matched independently against the same control population using 1:20 nearest neighbor matching with caliper = 0.2"
+  )
+
+print(summary_table)
+
+cat("\n=== FINAL SUMMARY ===\n")
+cat("Individual propensity score matching completed for", nrow(summary_results), "chronic dermatological conditions\n")
+cat("Each condition now has its own matched control cohort with balanced demographics\n")
+cat("Ready for condition-specific outcome analyses\n")
+```
+
+### PHQ Outcome Analyses for Each Condition vs Matched Controls
+
+```{r}
+# helper function to add PHQ positivity columns
+add_phq_positivity_columns <- function(dt) {
+  # find correct PHQ-2 column name
+  phq2_col_names <- c(
+    "phq_value_CMS_PHQ.2_POS.NEG",      
+    "phq_value_CMS_PHQ-2_POS/NEG", 
+    "phq_value_CMS PHQ-2 POS/NEG", 
+    "phq_value_CMS.PHQ.2.POS.NEG"
+  )
+  phq2_col <- NULL
+  for (col in phq2_col_names) {
+    if (col %in% names(dt)) {
+      phq2_col <- col
+      break
+    }
+  }
+  
+  # find correct PHQ-9 column name
+  phq9_col_names <- c(
+    "phq_value_CMS_PHQ.9_POS.NEG",
+    "phq_value_CMS PHQ-9 POS/NEG", 
+    "phq_value_CMS.PHQ.9.POS.NEG"
+  )
+  phq9_col <- NULL
+  for (col in phq9_col_names) {
+    if (col %in% names(dt)) {
+      phq9_col <- col
+      break
+    }
+  }
+  
+  # add PHQ-2 positivity column 
+  dt[, phq2_positive := FALSE]  # Start with all FALSE
+  
+  if (!is.null(phq2_col)) {
+    dt[get(phq2_col) == "Positive", phq2_positive := TRUE]
+  }
+  
+  if ("phq2_manual_posneg" %in% names(dt)) {
+    dt[phq2_manual_posneg == "Positive", phq2_positive := TRUE]
+  }
+  
+  # add PHQ-9 positivity column 
+  dt[, phq9_positive := FALSE]  # Start with all FALSE
+  
+  if (!is.null(phq9_col)) {
+    dt[get(phq9_col) == "Positive", phq9_positive := TRUE]
+  }
+  
+  if ("phq9_manual_sum" %in% names(dt)) {
+    dt[!is.na(phq9_manual_sum) & phq9_manual_sum >= 10, phq9_positive := TRUE]
+  }
+  
+  return(dt)
+}
+
+# to create comparison table
+create_comparison_table <- function(matrix, title, subtitle) {
+  or_result <- epitools::oddsratio(matrix)
+  chisq_result <- chisq.test(matrix)
+
+  df <- as.data.frame.matrix(matrix)
+  df <- tibble::rownames_to_column(df, "Group")
+  df$Total <- rowSums(matrix)
+  df$Proportion <- df$Positive / df$Total
+
+  gt(df) %>%
+    cols_label(
+      Group = "Cohort",
+      Positive = "Positive",
+      Negative = "Negative",
+      Total = "Total Patients",
+      Proportion = "Positivity Rate"
+    ) %>%
+    fmt_percent(columns = Proportion, decimals = 1) %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    tab_source_note(
+      source_note = paste0(
+        "Odds Ratio: ", round(or_result$measure[2, 1], 2),
+        " (95% CI: ", round(or_result$measure[2, 2], 2), " - ", round(or_result$measure[2, 3], 2), ")",
+        " | Chi-squared p-value: ", scales::pvalue(chisq_result$p.value)
+      )
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_body(rows = seq(2, nrow(df), 2))
+    ) %>%
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.top.width = px(3),
+      table.border.bottom.color = "#495057",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      table.font.size = px(12),
+      table.font.names = c("Calibri", "Segoe UI", "Arial", "sans-serif")
+    )
+}
+
+# PHQ outcome analysis for each condition
+condition_phq_results <- data.table()
+
+for (condition_name in names(condition_cohorts)) {
+  cat("\n=== PHQ OUTCOME ANALYSIS FOR", toupper(condition_name), "===\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  matched_patients <- cohort_data$after_matching
+  
+  # get condition patients (treat == 1) and control patients (treat == 0)
+  condition_patient_ids <- matched_patients[treat == 1, mrn_deid]
+  control_patient_ids <- matched_patients[treat == 0, mrn_deid]
+  
+  # get PHQ data for condition patients
+  condition_encounters <- result_wide_all[mrn_deid %in% condition_patient_ids]
+  condition_encounters <- add_phq_positivity_columns(condition_encounters)
+  
+  # get PHQ data for matched controls
+  control_encounters <- result_wide_all[mrn_deid %in% control_patient_ids]
+  control_encounters <- add_phq_positivity_columns(control_encounters)
+  
+  # patient-level PHQ positivity for condition patients
+  condition_phq_status <- condition_encounters[, .(
+    ever_phq2_positive = any(phq2_positive, na.rm = TRUE),
+    ever_phq9_positive = any(phq9_positive, na.rm = TRUE)
+  ), by = mrn_deid]
+  condition_phq_status[, group := condition_name]
+  
+  # patient-level PHQ positivity for controls
+  control_phq_status <- control_encounters[, .(
+    ever_phq2_positive = any(phq2_positive, na.rm = TRUE),
+    ever_phq9_positive = any(phq9_positive, na.rm = TRUE)
+  ), by = mrn_deid]
+  control_phq_status[, group := "Control"]
+  
+  # combine data
+  combined_phq_data <- rbind(condition_phq_status, control_phq_status)
+  
+  # store results for summary table
+  condition_phq_results <- rbind(condition_phq_results, data.table(
+    Condition = condition_name,
+    Condition_N = nrow(condition_phq_status),
+    Control_N = nrow(control_phq_status),
+    Condition_PHQ2_Pos = sum(condition_phq_status$ever_phq2_positive, na.rm = TRUE),
+    Condition_PHQ2_Rate = round(mean(condition_phq_status$ever_phq2_positive, na.rm = TRUE) * 100, 1),
+    Control_PHQ2_Pos = sum(control_phq_status$ever_phq2_positive, na.rm = TRUE),
+    Control_PHQ2_Rate = round(mean(control_phq_status$ever_phq2_positive, na.rm = TRUE) * 100, 1),
+    Condition_PHQ9_Pos = sum(condition_phq_status$ever_phq9_positive, na.rm = TRUE),
+    Condition_PHQ9_Rate = round(mean(condition_phq_status$ever_phq9_positive, na.rm = TRUE) * 100, 1),
+    Control_PHQ9_Pos = sum(control_phq_status$ever_phq9_positive, na.rm = TRUE),
+    Control_PHQ9_Rate = round(mean(control_phq_status$ever_phq9_positive, na.rm = TRUE) * 100, 1)
+  ))
+  
+  # PHQ-2 Analysis
+  if(sum(combined_phq_data$ever_phq2_positive, na.rm = TRUE) >= 10) {
+    combined_phq_data$ever_phq2_positive_factor <- factor(combined_phq_data$ever_phq2_positive, 
+                                                         levels = c(TRUE, FALSE), 
+                                                         labels = c("Positive", "Negative"))
+    combined_phq_data$group_factor <- factor(combined_phq_data$group, 
+                                            levels = c(condition_name, "Control"))
+    
+    phq2_table <- table(
+      Group = combined_phq_data$group_factor,
+      PHQ2 = combined_phq_data$ever_phq2_positive_factor
+    )
+    
+    cat("\n--- PHQ-2 Results ---\n")
+    print(create_comparison_table(phq2_table, 
+                                paste("PHQ-2 Positivity:", condition_name, "vs Matched Controls"), 
+                                paste("Analysis using", nrow(condition_phq_status), condition_name, "patients and", nrow(control_phq_status), "matched controls")))
+  } else {
+    cat("Insufficient PHQ-2 positive cases for", condition_name, "analysis\n")
+  }
+  
+  # PHQ-9 Analysis
+  if(sum(combined_phq_data$ever_phq9_positive, na.rm = TRUE) >= 10) {
+    combined_phq_data$ever_phq9_positive_factor <- factor(combined_phq_data$ever_phq9_positive, 
+                                                         levels = c(TRUE, FALSE), 
+                                                         labels = c("Positive", "Negative"))
+    
+    phq9_table <- table(
+      Group = combined_phq_data$group_factor,
+      PHQ9 = combined_phq_data$ever_phq9_positive_factor
+    )
+    
+    cat("\n--- PHQ-9 Results ---\n")
+    print(create_comparison_table(phq9_table, 
+                                paste("PHQ-9 Positivity:", condition_name, "vs Matched Controls"), 
+                                paste("Analysis using", nrow(condition_phq_status), condition_name, "patients and", nrow(control_phq_status), "matched controls")))
+  } else {
+    cat("Insufficient PHQ-9 positive cases for", condition_name, "analysis\n")
+  }
+}
+```
+
+### Summary Table of All Condition PHQ Results
+
+```{r}
+# calculate p-values for each condition
+calculate_phq_pvalues <- function(condition_phq_results) {
+  pvalues <- data.frame(
+    Condition = condition_phq_results$Condition,
+    PHQ2_pvalue = NA,
+    PHQ9_pvalue = NA
+  )
+  
+  for (i in 1:nrow(condition_phq_results)) {
+    # PHQ-2 chi-squared test
+    phq2_matrix <- matrix(c(
+      condition_phq_results$Condition_PHQ2_Pos[i],
+      condition_phq_results$Condition_N[i] - condition_phq_results$Condition_PHQ2_Pos[i],
+      condition_phq_results$Control_PHQ2_Pos[i],
+      condition_phq_results$Control_N[i] - condition_phq_results$Control_PHQ2_Pos[i]
+    ), nrow = 2, byrow = TRUE)
+    
+    # PHQ-9 chi-squared test
+    phq9_matrix <- matrix(c(
+      condition_phq_results$Condition_PHQ9_Pos[i],
+      condition_phq_results$Condition_N[i] - condition_phq_results$Condition_PHQ9_Pos[i],
+      condition_phq_results$Control_PHQ9_Pos[i],
+      condition_phq_results$Control_N[i] - condition_phq_results$Control_PHQ9_Pos[i]
+    ), nrow = 2, byrow = TRUE)
+    
+    tryCatch({
+      pvalues$PHQ2_pvalue[i] <- chisq.test(phq2_matrix)$p.value
+    }, error = function(e) {
+      pvalues$PHQ2_pvalue[i] <- 1.0
+    })
+    
+    tryCatch({
+      pvalues$PHQ9_pvalue[i] <- chisq.test(phq9_matrix)$p.value
+    }, error = function(e) {
+      pvalues$PHQ9_pvalue[i] <- 1.0
+    })
+  }
+  
+  return(pvalues)
+}
+
+# p-values
+phq_pvalues <- calculate_phq_pvalues(condition_phq_results)
+
+# comprehensive PHQ results summary table
+phq_summary_table <- condition_phq_results %>%
+  left_join(phq_pvalues, by = "Condition") %>%
+  mutate(
+    PHQ2_OR = round((Condition_PHQ2_Pos/(Condition_N - Condition_PHQ2_Pos)) / (Control_PHQ2_Pos/(Control_N - Control_PHQ2_Pos)), 2),
+    PHQ9_OR = round((Condition_PHQ9_Pos/(Condition_N - Condition_PHQ9_Pos)) / (Control_PHQ9_Pos/(Control_N - Control_PHQ9_Pos)), 2),
+    PHQ2_Rate_Diff = round(Condition_PHQ2_Rate - Control_PHQ2_Rate, 1),
+    PHQ9_Rate_Diff = round(Condition_PHQ9_Rate - Control_PHQ9_Rate, 1),
+    PHQ2_Rate_Diff_Sig = ifelse(PHQ2_pvalue < 0.05, paste0(PHQ2_Rate_Diff, "*"), as.character(PHQ2_Rate_Diff)),
+    PHQ9_Rate_Diff_Sig = ifelse(PHQ9_pvalue < 0.05, paste0(PHQ9_Rate_Diff, "*"), as.character(PHQ9_Rate_Diff))
+  ) %>%
+  select(Condition, Condition_N, Control_N, 
+         Condition_PHQ2_Rate, Control_PHQ2_Rate, PHQ2_Rate_Diff_Sig, PHQ2_OR,
+         Condition_PHQ9_Rate, Control_PHQ9_Rate, PHQ9_Rate_Diff_Sig, PHQ9_OR) %>%
+  gt() %>%
+  tab_header(
+    title = "PHQ Positivity Rates by Chronic Dermatological Condition vs Matched Controls",
+    subtitle = "Patient-level analysis showing depression screening outcomes for each condition"
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    Condition_N = "Condition N",
+    Control_N = "Control N",
+    Condition_PHQ2_Rate = "Condition (%)",
+    Control_PHQ2_Rate = "Control (%)",
+    PHQ2_Rate_Diff_Sig = "Difference",
+    PHQ2_OR = "Odds Ratio",
+    Condition_PHQ9_Rate = "Condition (%)",
+    Control_PHQ9_Rate = "Control (%)",
+    PHQ9_Rate_Diff_Sig = "Difference", 
+    PHQ9_OR = "Odds Ratio"
+  ) %>%
+  tab_spanner(label = "Sample Sizes", columns = c(Condition_N, Control_N)) %>%
+  tab_spanner(label = "PHQ-2 Positivity", columns = c(Condition_PHQ2_Rate, Control_PHQ2_Rate, PHQ2_Rate_Diff_Sig, PHQ2_OR)) %>%
+  tab_spanner(label = "PHQ-9 Positivity", columns = c(Condition_PHQ9_Rate, Control_PHQ9_Rate, PHQ9_Rate_Diff_Sig, PHQ9_OR)) %>%
+  fmt_number(columns = c(Condition_PHQ2_Rate, Control_PHQ2_Rate, 
+                         Condition_PHQ9_Rate, Control_PHQ9_Rate), decimals = 1) %>%
+  fmt_number(columns = c(PHQ2_OR, PHQ9_OR), decimals = 2) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(condition_phq_results), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(11),
+    table.font.names = c("Calibri", "Segoe UI", "Arial", "sans-serif")
+  ) %>%
+  tab_footnote(
+    footnote = "Positive differences indicate higher rates in condition group vs controls. * indicates p<0.05 from chi-squared test.",
+    locations = cells_column_labels(columns = PHQ2_Rate_Diff_Sig)
+  ) %>%
+  tab_source_note(
+    source_note = "Each condition analyzed using individual propensity score matched controls. Odds ratios calculated from 2x2 contingency tables."
+  )
+
+print(phq_summary_table)
+
+# separate PHQ-2 and PHQ-9 tables
+phq2_table <- condition_phq_results %>%
+  left_join(phq_pvalues, by = "Condition") %>%
+  mutate(
+    PHQ2_OR = round((Condition_PHQ2_Pos/(Condition_N - Condition_PHQ2_Pos)) / (Control_PHQ2_Pos/(Control_N - Control_PHQ2_Pos)), 2),
+    PHQ2_Rate_Diff = round(Condition_PHQ2_Rate - Control_PHQ2_Rate, 1),
+    PHQ2_Rate_Diff_Sig = ifelse(PHQ2_pvalue < 0.05, paste0(PHQ2_Rate_Diff, "*"), as.character(PHQ2_Rate_Diff))
+  ) %>%
+  select(Condition, Condition_N, Control_N, 
+         Condition_PHQ2_Rate, Control_PHQ2_Rate, PHQ2_Rate_Diff_Sig, PHQ2_OR) %>%
+  gt() %>%
+  tab_header(
+    title = "PHQ-2 Positivity Rates by Chronic Dermatological Condition vs Matched Controls",
+    subtitle = "Patient-level analysis showing PHQ-2 depression screening outcomes for each condition"
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    Condition_N = "Condition N",
+    Control_N = "Control N",
+    Condition_PHQ2_Rate = "Condition (%)",
+    Control_PHQ2_Rate = "Control (%)",
+    PHQ2_Rate_Diff_Sig = "Difference",
+    PHQ2_OR = "Odds Ratio"
+  ) %>%
+  tab_spanner(label = "Sample Sizes", columns = c(Condition_N, Control_N)) %>%
+  tab_spanner(label = "PHQ-2 Positivity Rates", columns = c(Condition_PHQ2_Rate, Control_PHQ2_Rate, PHQ2_Rate_Diff_Sig, PHQ2_OR)) %>%
+  fmt_number(columns = c(Condition_PHQ2_Rate, Control_PHQ2_Rate), decimals = 1) %>%
+  fmt_number(columns = PHQ2_OR, decimals = 2) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(condition_phq_results), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(11),
+    table.font.names = c("Calibri", "Segoe UI", "Arial", "sans-serif")
+  ) %>%
+  tab_footnote(
+    footnote = "Positive differences indicate higher rates in condition group vs controls. * indicates p<0.05 from chi-squared test.",
+    locations = cells_column_labels(columns = PHQ2_Rate_Diff_Sig)
+  ) %>%
+  tab_source_note(
+    source_note = "Each condition analyzed using individual propensity score matched controls. PHQ-2 positive defined as score ≥3."
+  )
+
+phq9_table <- condition_phq_results %>%
+  left_join(phq_pvalues, by = "Condition") %>%
+  mutate(
+    PHQ9_OR = round((Condition_PHQ9_Pos/(Condition_N - Condition_PHQ9_Pos)) / (Control_PHQ9_Pos/(Control_N - Control_PHQ9_Pos)), 2),
+    PHQ9_Rate_Diff = round(Condition_PHQ9_Rate - Control_PHQ9_Rate, 1),
+    PHQ9_Rate_Diff_Sig = ifelse(PHQ9_pvalue < 0.05, paste0(PHQ9_Rate_Diff, "*"), as.character(PHQ9_Rate_Diff))
+  ) %>%
+  select(Condition, Condition_N, Control_N, 
+         Condition_PHQ9_Rate, Control_PHQ9_Rate, PHQ9_Rate_Diff_Sig, PHQ9_OR) %>%
+  gt() %>%
+  tab_header(
+    title = "PHQ-9 Positivity Rates by Chronic Dermatological Condition vs Matched Controls",
+    subtitle = "Patient-level analysis showing PHQ-9 depression screening outcomes for each condition"
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    Condition_N = "Condition N",
+    Control_N = "Control N",
+    Condition_PHQ9_Rate = "Condition (%)",
+    Control_PHQ9_Rate = "Control (%)",
+    PHQ9_Rate_Diff_Sig = "Difference",
+    PHQ9_OR = "Odds Ratio"
+  ) %>%
+  tab_spanner(label = "Sample Sizes", columns = c(Condition_N, Control_N)) %>%
+  tab_spanner(label = "PHQ-9 Positivity Rates", columns = c(Condition_PHQ9_Rate, Control_PHQ9_Rate, PHQ9_Rate_Diff_Sig, PHQ9_OR)) %>%
+  fmt_number(columns = c(Condition_PHQ9_Rate, Control_PHQ9_Rate), decimals = 1) %>%
+  fmt_number(columns = PHQ9_OR, decimals = 2) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(condition_phq_results), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(11),
+    table.font.names = c("Calibri", "Segoe UI", "Arial", "sans-serif")
+  ) %>%
+  tab_footnote(
+    footnote = "Positive differences indicate higher rates in condition group vs controls. * indicates p<0.05 from chi-squared test.",
+    locations = cells_column_labels(columns = PHQ9_Rate_Diff_Sig)
+  ) %>%
+  tab_source_note(
+    source_note = "Each condition analyzed using individual propensity score matched controls. PHQ-9 positive defined as score ≥10."
+  )
+
+cat("\n=== SEPARATE PHQ-2 AND PHQ-9 TABLES ===\n")
+print(phq2_table)
+cat("\n")
+print(phq9_table)
+
+cat("\n=== PHQ OUTCOME ANALYSIS COMPLETE ===\n")
+cat("Analyzed PHQ-2 and PHQ-9 outcomes for", length(condition_cohorts), "chronic dermatological conditions\n")
+cat("Each condition compared to its own propensity-matched control cohort\n")
+cat("Results show condition-specific depression screening patterns\n")
+```
