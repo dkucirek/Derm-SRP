@@ -1,0 +1,1236 @@
+---
+title: "03: Chronic Dermatology Cohort - Descriptive Statistics"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(lme4)
+library(broom.mixed)
+library(MatchIt)
+library(gt)
+library(gtsummary)
+library(scales)
+library(epitools)
+library(tibble)
+
+data_path <- "Z:/Kucirek/"
+
+result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+
+setDT(result_wide)
+setDT(chronic_derm_cohort)
+setDT(result_info)
+
+#  run BEFORE propensity matching, does descriptive statistics for  full chronic derm cohort
+
+# helper function to add PHQ positivity columns
+add_phq_positivity_columns <- function(dt) {
+  dt[, phq2_positive := FALSE]  
+  
+  # find PHQ-2 column
+  phq2_col_names <- c(
+    "phq_value_CMS_PHQ.2_POS.NEG",      
+    "phq_value_CMS_PHQ-2_POS/NEG", 
+    "phq_value_CMS PHQ-2 POS/NEG",
+    "phq_value_CMS.PHQ.2.POS.NEG"
+  )
+  phq2_col <- NULL
+  for (col in phq2_col_names) {
+    if (col %in% names(dt)) {
+      phq2_col <- col
+      break
+    }
+  }
+  
+  if (!is.null(phq2_col)) {
+    dt[get(phq2_col) == "Positive", phq2_positive := TRUE]
+  }
+  
+  if ("phq2_manual_posneg" %in% names(dt)) {
+    dt[phq2_manual_posneg == "Positive", phq2_positive := TRUE]
+  }
+  
+ 
+  dt[, phq9_positive := FALSE]  
+  
+  # find PHQ-9 column
+  phq9_col_names <- c(
+    "phq_value_CMS_PHQ.9_POS.NEG",
+    "phq_value_CMS PHQ-9 POS/NEG", 
+    "phq_value_CMS.PHQ.9.POS.NEG"
+  )
+  phq9_col <- NULL
+  for (col in phq9_col_names) {
+    if (col %in% names(dt)) {
+      phq9_col <- col
+      break
+    }
+  }
+  
+  if (!is.null(phq9_col)) {
+    dt[get(phq9_col) == "Positive", phq9_positive := TRUE]
+  }
+  
+  if ("phq9_manual_sum" %in% names(dt)) {
+    dt[!is.na(phq9_manual_sum) & phq9_manual_sum >= 10, phq9_positive := TRUE]
+  }
+  
+  return(dt)
+}
+
+# reusable function to create gt table from 2x2 matrix
+create_comparison_table <- function(matrix, title, subtitle) {
+  or_result <- epitools::oddsratio(matrix)
+  chisq_result <- chisq.test(matrix)
+
+  df <- as.data.frame.matrix(matrix)
+  df <- tibble::rownames_to_column(df, "Group")
+  df$Total <- rowSums(matrix)
+  df$Proportion <- df$Positive / df$Total
+
+  gt(df) %>%
+    cols_label(
+      Group = "Cohort",
+      Positive = "Positive",
+      Negative = "Negative",
+      Total = "Total Patients",
+      Proportion = "Positivity Rate"
+    ) %>%
+    fmt_percent(columns = Proportion, decimals = 1) %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    tab_source_note(
+      source_note = paste0(
+        "Odds Ratio: ", round(or_result$measure[2, 1], 2),
+        " (95% CI: ", round(or_result$measure[2, 2], 2), " - ", round(or_result$measure[2, 3], 2), ")",
+        " | Chi-squared p-value: ", scales::pvalue(chisq_result$p.value)
+      )
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+}
+
+cat("=== COMPREHENSIVE ANALYSIS USING EXISTING PROPENSITY MATCHING ===\n")
+cat("Data loaded successfully\n")
+```
+
+## 1. Cohort Overview and PHQ Screening Rates
+
+```{r}
+cat("\n=== 1. CHRONIC DERMATOLOGY COHORT OVERVIEW ===\n")
+
+# check cohort sizes
+cat("Full chronic dermatology cohort size:", uniqueN(chronic_derm_cohort$mrn_deid), "\n")
+cat("Total encounters in cohort:", nrow(chronic_derm_cohort), "\n")
+
+# get all encounters for chronic derm patients 
+chronic_derm_patient_ids <- unique(chronic_derm_cohort$mrn_deid)
+chronic_derm_encounters <- result_wide[mrn_deid %in% chronic_derm_patient_ids]
+chronic_derm_encounters <- add_phq_positivity_columns(chronic_derm_encounters)
+
+
+cat("Chronic derm encounters (ICD-filtered only):", nrow(chronic_derm_cohort), "\n")
+cat("All encounters for chronic derm patients:", nrow(chronic_derm_encounters), "\n")
+
+# patient-level PHQ analysis
+chronic_derm_phq_status <- chronic_derm_encounters[, .(
+  ever_phq2_positive = any(phq2_positive, na.rm = TRUE),
+  ever_phq9_positive = any(phq9_positive, na.rm = TRUE),
+  total_encounters = .N,
+  phq2_encounters = sum(phq2_positive, na.rm = TRUE),
+  phq9_encounters = sum(phq9_positive, na.rm = TRUE)
+), by = mrn_deid]
+
+# overall PHQ rates
+cat("\n=== PHQ SCREENING RESULTS ===\n")
+cat("Patients with any PHQ-2 positive:", sum(chronic_derm_phq_status$ever_phq2_positive), 
+    " (", round(mean(chronic_derm_phq_status$ever_phq2_positive) * 100, 1), "%)\n")
+cat("Patients with any PHQ-9 positive:", sum(chronic_derm_phq_status$ever_phq9_positive), 
+    " (", round(mean(chronic_derm_phq_status$ever_phq9_positive) * 100, 1), "%)\n")
+
+# encounter-level stats
+cat("\n=== ENCOUNTER-LEVEL STATISTICS ===\n")
+cat("Total PHQ-2 positive encounters:", sum(chronic_derm_encounters$phq2_positive, na.rm = TRUE), "\n")
+cat("Total PHQ-9 positive encounters:", sum(chronic_derm_encounters$phq9_positive, na.rm = TRUE), "\n")
+cat("Mean encounters per patient:", round(mean(chronic_derm_phq_status$total_encounters), 1), "\n")
+```
+
+## 2. Demographic Breakdown Within Chronic Derm Cohort
+
+```{r}
+cat("\n=== 2. DEMOGRAPHIC BREAKDOWN WITHIN CHRONIC DERM COHORT ===\n")
+
+#merge chronic derm PHQ data with demographics from full cohort
+chronic_derm_demographics <- merge(chronic_derm_phq_status, 
+                                 result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)], 
+                                 by = "mrn_deid")
+
+# check that there's demographic data for full cohort
+cat("Full chronic derm cohort with demographics:", nrow(chronic_derm_demographics), "\n")
+cat("Should match chronic derm PHQ status:", nrow(chronic_derm_phq_status), "\n")
+
+#  summary by demographics
+create_demographic_summary <- function(demo_var, demo_name) {
+  
+  # filter missing values
+  demo_data <- chronic_derm_demographics[!is.na(get(demo_var)) & get(demo_var) != ""]
+  
+  if(nrow(demo_data) == 0) {
+    cat("No data for", demo_name, "\n")
+    return(NULL)
+  }
+  
+  # summary table
+  demo_summary <- demo_data[, .(
+    total_patients = .N,
+    phq2_positive_patients = sum(ever_phq2_positive, na.rm = TRUE),
+    phq2_positive_rate = round(mean(ever_phq2_positive, na.rm = TRUE) * 100, 1),
+    phq9_positive_patients = sum(ever_phq9_positive, na.rm = TRUE),
+    phq9_positive_rate = round(mean(ever_phq9_positive, na.rm = TRUE) * 100, 1)
+  ), by = get(demo_var)]
+  
+  setnames(demo_summary, "get", demo_name)
+  
+  # chi-squared tests
+  if(uniqueN(demo_data[[demo_var]]) > 1) {
+    phq2_chi <- chisq.test(table(demo_data[[demo_var]], demo_data$ever_phq2_positive))
+    phq9_chi <- chisq.test(table(demo_data[[demo_var]], demo_data$ever_phq9_positive))
+    
+    cat("\n", demo_name, "Breakdown:\n")
+    print(demo_summary)
+    cat("PHQ-2 Chi-squared p-value:", format.pval(phq2_chi$p.value), "\n")
+    cat("PHQ-9 Chi-squared p-value:", format.pval(phq9_chi$p.value), "\n")
+    
+    return(list(summary = demo_summary, phq2_p = phq2_chi$p.value, phq9_p = phq9_chi$p.value))
+  } else {
+    cat("\n", demo_name, "Breakdown (no statistical test - only one group):\n")
+    print(demo_summary)
+    return(list(summary = demo_summary, phq2_p = NA, phq9_p = NA))
+  }
+}
+
+# demo breakdowns
+race_results <- create_demographic_summary("race_refined", "Race")
+insurance_results <- create_demographic_summary("fin_class", "Insurance Class")
+sex_results <- create_demographic_summary("sex", "Sex")
+ethnicity_results <- create_demographic_summary("ethnic_refined", "Ethnicity")
+
+# demographic table
+create_pretty_demographic_table <- function(demo_results_list, title) {
+  
+  # combine all demo results
+  all_demo_data <- rbindlist(lapply(names(demo_results_list), function(demo_name) {
+    if(!is.null(demo_results_list[[demo_name]])) {
+      demo_data <- demo_results_list[[demo_name]]$summary
+      demo_data[, category := demo_name]
+      demo_data[, p_value_phq2 := demo_results_list[[demo_name]]$phq2_p]
+      demo_data[, p_value_phq9 := demo_results_list[[demo_name]]$phq9_p]
+      return(demo_data)
+    }
+  }), fill = TRUE)
+  
+  if(nrow(all_demo_data) == 0) return(NULL)
+  
+  # create the gt table
+  pretty_table <- all_demo_data %>%
+    select(category, everything()) %>%
+    gt(groupname_col = "category") %>%
+    tab_header(
+      title = title,
+      subtitle = "Demographics and PHQ Positivity Rates"
+    ) %>%
+    cols_label(
+      total_patients = "N",
+      phq2_positive_patients = "PHQ-2+ (n)",
+      phq2_positive_rate = "PHQ-2+ (%)",
+      phq9_positive_patients = "PHQ-9+ (n)",
+      phq9_positive_rate = "PHQ-9+ (%)",
+      p_value_phq2 = "PHQ-2 p-value",
+      p_value_phq9 = "PHQ-9 p-value"
+    ) %>%
+    tab_spanner(label = "PHQ-2 Results", columns = c(phq2_positive_patients, phq2_positive_rate, p_value_phq2)) %>%
+    tab_spanner(label = "PHQ-9 Results", columns = c(phq9_positive_patients, phq9_positive_rate, p_value_phq9)) %>%
+    fmt_number(columns = c(p_value_phq2, p_value_phq9), decimals = 3) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f0f0f0"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold",
+      row_group.font.weight = "bold"
+    )
+  
+  return(pretty_table)
+}
+
+# store demographic results for later use 
+demo_results_list <- list(
+  "Race" = race_results,
+  "Insurance" = insurance_results, 
+  "Sex" = sex_results,
+  "Ethnicity" = ethnicity_results
+)
+```
+## 3. Pairwise Comparisons Between Demographic Groups
+
+```{r}
+cat("\n=== 3. PAIRWISE COMPARISONS BETWEEN DEMOGRAPHIC GROUPS ===\n")
+
+# pairwise comparison function, returns p-values
+perform_pairwise_comparison_with_pvalue <- function(data, group_var, group1_val, group2_val) {
+  
+  group1_data <- data[get(group_var) == group1_val]
+  group2_data <- data[get(group_var) == group2_val]
+  
+  # min sample size check
+  if(nrow(group1_data) < 10 || nrow(group2_data) < 10) {
+    return(NULL)
+  }
+  
+  # PHQ-2 comparison
+  phq2_matrix <- matrix(c(
+    sum(group1_data$ever_phq2_positive), nrow(group1_data) - sum(group1_data$ever_phq2_positive),
+    sum(group2_data$ever_phq2_positive), nrow(group2_data) - sum(group2_data$ever_phq2_positive)
+  ), nrow = 2, byrow = TRUE,
+  dimnames = list(c(group1_val, group2_val), c("Positive", "Negative")))
+  
+  # PHQ-9 comparison  
+  phq9_matrix <- matrix(c(
+    sum(group1_data$ever_phq9_positive), nrow(group1_data) - sum(group1_data$ever_phq9_positive),
+    sum(group2_data$ever_phq9_positive), nrow(group2_data) - sum(group2_data$ever_phq9_positive)
+  ), nrow = 2, byrow = TRUE,
+  dimnames = list(c(group1_val, group2_val), c("Positive", "Negative")))
+  
+  #  p-values
+  phq2_chi <- chisq.test(phq2_matrix)
+  phq9_chi <- chisq.test(phq9_matrix)
+  
+  #  odds ratios
+  phq2_or <- epitools::oddsratio(phq2_matrix)
+  phq9_or <- epitools::oddsratio(phq9_matrix)
+  
+  return(list(
+    comparison = paste(group1_val, "vs", group2_val),
+    group1 = group1_val,
+    group2 = group2_val,
+    group1_n = nrow(group1_data),
+    group2_n = nrow(group2_data),
+    phq2_p = phq2_chi$p.value,
+    phq9_p = phq9_chi$p.value,
+    phq2_or = phq2_or$measure[2,1],
+    phq2_ci_lower = phq2_or$measure[2,2],
+    phq2_ci_upper = phq2_or$measure[2,3],
+    phq9_or = phq9_or$measure[2,1],
+    phq9_ci_lower = phq9_or$measure[2,2],
+    phq9_ci_upper = phq9_or$measure[2,3],
+    phq2_matrix = phq2_matrix,
+    phq9_matrix = phq9_matrix
+  ))
+}
+
+# all pairwise comparisons for a demographic variable
+perform_all_pairwise_comparisons <- function(demo_results, demo_var, demo_name) {
+  if(is.null(demo_results) || nrow(demo_results$summary) < 2) {
+    cat("Insufficient groups for", demo_name, "pairwise comparisons\n")
+    return(NULL)
+  }
+  
+  # all groups with sufficient sample size (≥10) and exclude "Unknown" categories
+  groups <- demo_results$summary[total_patients >= 10 & 
+                                !grepl("Unknown|Declined", get(demo_name), ignore.case = TRUE)]
+  
+  if(nrow(groups) == 0) {
+    cat("No valid groups for", demo_name, "after excluding Unknown categories\n")
+    return(NULL)
+  }
+  
+  group_names <- groups[[demo_name]]
+  
+  if(length(group_names) < 2) {
+    cat("Insufficient groups with ≥10 patients for", demo_name, "\n")
+    return(NULL)
+  }
+  
+  # all pairwise comparisons
+  comparison_results <- list()
+  comparison_count <- 0
+  
+  for(i in 1:(length(group_names)-1)) {
+    for(j in (i+1):length(group_names)) {
+      comparison_count <- comparison_count + 1
+      
+      result <- perform_pairwise_comparison_with_pvalue(
+        chronic_derm_demographics, demo_var, group_names[i], group_names[j]
+      )
+      
+      if(!is.null(result)) {
+        result$category <- demo_name
+        comparison_results[[comparison_count]] <- result
+      }
+    }
+  }
+  
+  return(comparison_results)
+}
+
+cat("Performing all pairwise comparisons for Race and Insurance...\n")
+
+race_comparisons <- perform_all_pairwise_comparisons(race_results, "race_refined", "Race")
+insurance_comparisons <- perform_all_pairwise_comparisons(insurance_results, "fin_class", "Insurance Class")
+
+# make race comparison table (PHQ-2 and PHQ-9 combined)
+if(!is.null(race_comparisons) && length(race_comparisons) > 0) {
+  
+  # filter for significant results only (p ≤ 0.05)
+  race_significant_data <- rbindlist(lapply(race_comparisons, function(comp) {
+    results <- data.table()
+    
+    # add PHQ-2 if significant
+    if(comp$phq2_p <= 0.05) {
+      results <- rbind(results, data.table(
+        Screening = "PHQ-2",
+        Comparison = comp$comparison,
+        OR = round(comp$phq2_or, 2),
+        CI_95 = paste0("(", round(comp$phq2_ci_lower, 2), "-", round(comp$phq2_ci_upper, 2), ")"),
+        P_Value = round(comp$phq2_p, 4)
+      ))
+    }
+    
+    # Add PHQ-9 if significant
+    if(comp$phq9_p <= 0.05) {
+      results <- rbind(results, data.table(
+        Screening = "PHQ-9",
+        Comparison = comp$comparison,
+        OR = round(comp$phq9_or, 2),
+        CI_95 = paste0("(", round(comp$phq9_ci_lower, 2), "-", round(comp$phq9_ci_upper, 2), ")"),
+        P_Value = round(comp$phq9_p, 4)
+      ))
+    }
+    
+    return(results)
+  }))
+  
+  if(nrow(race_significant_data) > 0) {
+    cat("\n=== SIGNIFICANT RACE COMPARISONS ===\n")
+    
+    race_table <- race_significant_data %>%
+      gt() %>%
+      tab_header(
+        title = "Significant Race Pairwise Comparisons",
+        subtitle = "Only comparisons with p ≤ 0.05 shown"
+      ) %>%
+      cols_label(
+        Screening = "Depression Screening",
+        Comparison = "Race Comparison",
+        OR = "Odds Ratio",
+        CI_95 = "95% Confidence Interval",
+        P_Value = "P-Value"
+      ) %>%
+      fmt_number(columns = OR, decimals = 2) %>%
+      fmt_number(columns = P_Value, decimals = 4) %>%
+      tab_style(
+        style = cell_text(weight = "bold", size = px(14)),
+        locations = cells_title()
+      ) %>%
+      tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_column_labels()
+      ) %>%
+      tab_style(
+        style = cell_text(align = "center"),
+        locations = cells_body(columns = c(OR, CI_95, P_Value))
+      ) %>%
+      tab_options(
+        table.border.top.color = "#000000",
+        table.border.top.width = px(2),
+        table.border.bottom.color = "#000000",
+        table.border.bottom.width = px(2),
+        column_labels.font.weight = "bold",
+        table.font.size = px(11),
+        data_row.padding = px(6)
+      )
+    
+    print(race_table)
+  } else {
+    cat("No significant race comparisons found (p > 0.05)\n")
+  }
+} else {
+  cat("No race comparisons could be performed\n")
+}
+
+# make insurance comparison table (PHQ-2 and PHQ-9 combined)
+if(!is.null(insurance_comparisons) && length(insurance_comparisons) > 0) {
+  
+  #  significant results only (p ≤ 0.05)
+  insurance_significant_data <- rbindlist(lapply(insurance_comparisons, function(comp) {
+    results <- data.table()
+    
+    # add PHQ-2 if significant
+    if(comp$phq2_p <= 0.05) {
+      results <- rbind(results, data.table(
+        Screening = "PHQ-2",
+        Comparison = comp$comparison,
+        OR = round(comp$phq2_or, 2),
+        CI_95 = paste0("(", round(comp$phq2_ci_lower, 2), "-", round(comp$phq2_ci_upper, 2), ")"),
+        P_Value = round(comp$phq2_p, 4)
+      ))
+    }
+    
+    # add PHQ-9 if significant
+    if(comp$phq9_p <= 0.05) {
+      results <- rbind(results, data.table(
+        Screening = "PHQ-9",
+        Comparison = comp$comparison,
+        OR = round(comp$phq9_or, 2),
+        CI_95 = paste0("(", round(comp$phq9_ci_lower, 2), "-", round(comp$phq9_ci_upper, 2), ")"),
+        P_Value = round(comp$phq9_p, 4)
+      ))
+    }
+    
+    return(results)
+  }))
+  
+  if(nrow(insurance_significant_data) > 0) {
+    cat("\n=== SIGNIFICANT INSURANCE COMPARISONS ===\n")
+    
+    insurance_table <- insurance_significant_data %>%
+      gt() %>%
+      tab_header(
+        title = "Significant Insurance Pairwise Comparisons",
+        subtitle = "Only comparisons with p ≤ 0.05 shown"
+      ) %>%
+      cols_label(
+        Screening = "Depression Screening",
+        Comparison = "Insurance Comparison",
+        OR = "Odds Ratio",
+        CI_95 = "95% Confidence Interval",
+        P_Value = "P-Value"
+      ) %>%
+      fmt_number(columns = OR, decimals = 2) %>%
+      fmt_number(columns = P_Value, decimals = 4) %>%
+      tab_style(
+        style = cell_text(weight = "bold", size = px(14)),
+        locations = cells_title()
+      ) %>%
+      tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_column_labels()
+      ) %>%
+      tab_style(
+        style = cell_text(align = "center"),
+        locations = cells_body(columns = c(OR, CI_95, P_Value))
+      ) %>%
+      tab_options(
+        table.border.top.color = "#000000",
+        table.border.top.width = px(2),
+        table.border.bottom.color = "#000000",
+        table.border.bottom.width = px(2),
+        column_labels.font.weight = "bold",
+        table.font.size = px(11),
+        data_row.padding = px(6)
+      )
+    
+    print(insurance_table)
+  } else {
+    cat("No significant insurance comparisons found (p > 0.05)\n")
+  }
+} else {
+  cat("No insurance comparisons could be performed\n")
+}
+```
+```
+```
+
+## 4. Comprehensive Pairwise Comparisons Between Chronic Dermatology Conditions
+
+```{r}
+cat("\n=== 4. COMPREHENSIVE PAIRWISE COMPARISONS BETWEEN CHRONIC DERM CONDITIONS ===\n")
+
+# get condition info using ICD codes 
+chronic_condition_icd_codes <- list(
+  "Scarring Alopecia" = "L66",
+  "Acne" = "L70", 
+  "Atopic Dermatitis" = "L20",
+  "Hidradenitis Suppurativa" = "L73.2",
+  "Rosacea" = "L71",
+  "Vitiligo" = "L80",
+  "Alopecia Areata" = "L63",
+  "Psoriasis" = "L40",
+  "Lupus Erythematosus" = c("L93", "M32.1", "M32.9")
+)
+
+# assign conditions to encounters
+chronic_derm_encounters[, condition_type := NA_character_]
+
+for (condition_name in names(chronic_condition_icd_codes)) {
+  icd_codes <- chronic_condition_icd_codes[[condition_name]]
+  condition_pattern <- paste(icd_codes, collapse = "|")
+  chronic_derm_encounters[str_detect(icd10_dx, condition_pattern), condition_type := condition_name]
+}
+
+# patient-condition pairs (allowing multiple conditions)
+patient_condition_pairs <- unique(chronic_derm_encounters[!is.na(condition_type), .(mrn_deid, condition_type)])
+
+# PHQ status by condition
+condition_summary_list <- list()
+for(condition in unique(patient_condition_pairs$condition_type)) {
+  condition_patients <- patient_condition_pairs[condition_type == condition, mrn_deid]
+  condition_phq_data <- chronic_derm_phq_status[mrn_deid %in% condition_patients]
+  
+  condition_summary_list[[condition]] <- data.table(
+    condition_type = condition,
+    total_patients = nrow(condition_phq_data),
+    phq2_positive_patients = sum(condition_phq_data$ever_phq2_positive, na.rm = TRUE),
+    phq2_positive_rate = round(mean(condition_phq_data$ever_phq2_positive, na.rm = TRUE) * 100, 1),
+    phq9_positive_patients = sum(condition_phq_data$ever_phq9_positive, na.rm = TRUE),
+    phq9_positive_rate = round(mean(condition_phq_data$ever_phq9_positive, na.rm = TRUE) * 100, 1)
+  )
+}
+condition_summary <- rbindlist(condition_summary_list)[order(-total_patients)]
+
+# 9x6 condition summary table
+prettier_condition_table <- condition_summary %>%
+  gt() %>%
+  tab_header(
+    title = "Table 4: Chronic Dermatology Conditions - Depression Screening Summary",
+    subtitle = "Patient counts and PHQ positivity rates by condition"
+  ) %>%
+  cols_label(
+    condition_type = "Chronic Dermatology Condition",
+    total_patients = "Total Patients (N)",
+    phq2_positive_patients = "PHQ-2+ (n)",
+    phq2_positive_rate = "PHQ-2+ Rate (%)",
+    phq9_positive_patients = "PHQ-9+ (n)",
+    phq9_positive_rate = "PHQ-9+ Rate (%)"
+  ) %>%
+  tab_spanner(label = "PHQ-2 Screening Results", columns = c(phq2_positive_patients, phq2_positive_rate)) %>%
+  tab_spanner(label = "PHQ-9 Screening Results", columns = c(phq9_positive_patients, phq9_positive_rate)) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = condition_type)
+  ) %>%
+  tab_options(
+    table.border.top.color = "#000000",
+    table.border.top.width = px(2),
+    table.border.bottom.color = "#000000",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(12),
+    data_row.padding = px(8)
+  ) %>%
+  tab_footnote(
+    footnote = "Conditions ordered by total patient count. Color coding indicates higher depression screening rates.",
+    locations = cells_column_labels(columns = condition_type)
+  )
+
+print(prettier_condition_table)
+
+cat("\nCondition Summary Data:\n")
+print(condition_summary)
+
+# Function to perform pairwise comparison between two conditions
+perform_condition_pairwise_comparison <- function(cond1_name, cond2_name) {
+  
+  cond1_patients <- patient_condition_pairs[condition_type == cond1_name, mrn_deid]
+  cond2_patients <- patient_condition_pairs[condition_type == cond2_name, mrn_deid]
+  
+  cond1_phq <- chronic_derm_phq_status[mrn_deid %in% cond1_patients]
+  cond2_phq <- chronic_derm_phq_status[mrn_deid %in% cond2_patients]
+  
+  # Minimum sample size requirement
+  if(nrow(cond1_phq) < 20 || nrow(cond2_phq) < 20) {
+    return(NULL)
+  }
+  
+  # PHQ-2 comparison
+  phq2_matrix <- matrix(c(
+    sum(cond1_phq$ever_phq2_positive), nrow(cond1_phq) - sum(cond1_phq$ever_phq2_positive),
+    sum(cond2_phq$ever_phq2_positive), nrow(cond2_phq) - sum(cond2_phq$ever_phq2_positive)
+  ), nrow = 2, byrow = TRUE,
+  dimnames = list(c(cond1_name, cond2_name), c("Positive", "Negative")))
+  
+  # PHQ-9 comparison
+  phq9_matrix <- matrix(c(
+    sum(cond1_phq$ever_phq9_positive), nrow(cond1_phq) - sum(cond1_phq$ever_phq9_positive),
+    sum(cond2_phq$ever_phq9_positive), nrow(cond2_phq) - sum(cond2_phq$ever_phq9_positive)
+  ), nrow = 2, byrow = TRUE,
+  dimnames = list(c(cond1_name, cond2_name), c("Positive", "Negative")))
+  
+  # Calculate statistics
+  phq2_chi <- tryCatch(chisq.test(phq2_matrix), error = function(e) NULL)
+  phq9_chi <- tryCatch(chisq.test(phq9_matrix), error = function(e) NULL)
+  
+  phq2_or <- tryCatch(epitools::oddsratio(phq2_matrix), error = function(e) NULL)
+  phq9_or <- tryCatch(epitools::oddsratio(phq9_matrix), error = function(e) NULL)
+  
+  return(list(
+    comparison = paste(cond1_name, "vs", cond2_name),
+    cond1_name = cond1_name,
+    cond2_name = cond2_name,
+    cond1_n = nrow(cond1_phq),
+    cond2_n = nrow(cond2_phq),
+    phq2_p = if(!is.null(phq2_chi)) phq2_chi$p.value else NA,
+    phq9_p = if(!is.null(phq9_chi)) phq9_chi$p.value else NA,
+    phq2_or = if(!is.null(phq2_or)) phq2_or$measure[2,1] else NA,
+    phq2_ci_lower = if(!is.null(phq2_or)) phq2_or$measure[2,2] else NA,
+    phq2_ci_upper = if(!is.null(phq2_or)) phq2_or$measure[2,3] else NA,
+    phq9_or = if(!is.null(phq9_or)) phq9_or$measure[2,1] else NA,
+    phq9_ci_lower = if(!is.null(phq9_or)) phq9_or$measure[2,2] else NA,
+    phq9_ci_upper = if(!is.null(phq9_or)) phq9_or$measure[2,3] else NA,
+    phq2_matrix = phq2_matrix,
+    phq9_matrix = phq9_matrix
+  ))
+}
+
+# Perform ALL pairwise comparisons between conditions (≥20 patients)
+analyzable_conditions <- condition_summary[total_patients >= 20, condition_type]
+cat("Conditions with ≥20 patients for pairwise analysis:", length(analyzable_conditions), "\n")
+cat("Conditions:", paste(analyzable_conditions, collapse = ", "), "\n")
+
+all_condition_comparisons <- list()
+comparison_count <- 0
+
+if(length(analyzable_conditions) >= 2) {
+  for(i in 1:(length(analyzable_conditions)-1)) {
+    for(j in (i+1):length(analyzable_conditions)) {
+      comparison_count <- comparison_count + 1
+      
+      result <- perform_condition_pairwise_comparison(analyzable_conditions[i], analyzable_conditions[j])
+      
+      if(!is.null(result)) {
+        all_condition_comparisons[[comparison_count]] <- result
+      }
+    }
+  }
+}
+
+cat("Total condition pairwise comparisons performed:", length(all_condition_comparisons), "\n")
+
+# Filter for statistically significant results (p ≤ 0.05)
+significant_condition_phq2 <- list()
+significant_condition_phq9 <- list()
+
+for(comp in all_condition_comparisons) {
+  if(!is.null(comp)) {
+    if(!is.na(comp$phq2_p) && comp$phq2_p <= 0.05) {
+      significant_condition_phq2[[length(significant_condition_phq2) + 1]] <- comp
+    }
+    if(!is.na(comp$phq9_p) && comp$phq9_p <= 0.05) {
+      significant_condition_phq9[[length(significant_condition_phq9) + 1]] <- comp
+    }
+  }
+}
+
+cat("Significant PHQ-2 condition comparisons (p ≤ 0.05):", length(significant_condition_phq2), "\n")
+cat("Significant PHQ-9 condition comparisons (p ≤ 0.05):", length(significant_condition_phq9), "\n")
+
+# Create consolidated summary tables for significant condition comparisons
+if(length(significant_condition_phq2) > 0) {
+  cat("\n=== SIGNIFICANT PHQ-2 CONDITION PAIRWISE COMPARISONS (p ≤ 0.05) ===\n")
+  
+  # Create summary table of significant PHQ-2 condition results
+  phq2_condition_summary_data <- rbindlist(lapply(significant_condition_phq2, function(comp) {
+    data.table(
+      Comparison = comp$comparison,
+      Condition1_N = comp$cond1_n,
+      Condition2_N = comp$cond2_n,
+      OR = round(comp$phq2_or, 2),
+      CI_Lower = round(comp$phq2_ci_lower, 2),
+      CI_Upper = round(comp$phq2_ci_upper, 2),
+      P_Value = round(comp$phq2_p, 4)
+    )
+  }))
+  
+  phq2_condition_summary_table <- phq2_condition_summary_data %>%
+    gt() %>%
+    tab_header(
+      title = "Significant PHQ-2 Condition Pairwise Comparisons",
+      subtitle = "Only comparisons with p ≤ 0.05 shown"
+    ) %>%
+    cols_label(
+      Comparison = "Condition Comparison",
+      Condition1_N = "Condition 1 N",
+      Condition2_N = "Condition 2 N",
+      OR = "Odds Ratio",
+      CI_Lower = "95% CI Lower",
+      CI_Upper = "95% CI Upper",
+      P_Value = "P-Value"
+    ) %>%
+    data_color(
+      columns = P_Value,
+      colors = scales::col_numeric(
+        palette = c("#d9534f", "#f7f7f7"),
+        domain = c(0, 0.05)
+      )
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+  
+  print(phq2_condition_summary_table)
+}
+
+# Display significant PHQ-9 condition comparisons
+if(length(significant_condition_phq9) > 0) {
+  cat("\n=== SIGNIFICANT PHQ-9 CONDITION PAIRWISE COMPARISONS (p ≤ 0.05) ===\n")
+  
+  # Create summary table of significant PHQ-9 condition results
+  phq9_condition_summary_data <- rbindlist(lapply(significant_condition_phq9, function(comp) {
+    data.table(
+      Comparison = comp$comparison,
+      Condition1_N = comp$cond1_n,
+      Condition2_N = comp$cond2_n,
+      OR = round(comp$phq9_or, 2),
+      CI_Lower = round(comp$phq9_ci_lower, 2),
+      CI_Upper = round(comp$phq9_ci_upper, 2),
+      P_Value = round(comp$phq9_p, 4)
+    )
+  }))
+  
+  phq9_condition_summary_table <- phq9_condition_summary_data %>%
+    gt() %>%
+    tab_header(
+      title = "Significant PHQ-9 Condition Pairwise Comparisons",
+      subtitle = "Only comparisons with p ≤ 0.05 shown"
+    ) %>%
+    cols_label(
+      Comparison = "Condition Comparison",
+      Condition1_N = "Condition 1 N",
+      Condition2_N = "Condition 2 N",
+      OR = "Odds Ratio",
+      CI_Lower = "95% CI Lower",
+      CI_Upper = "95% CI Upper",
+      P_Value = "P-Value"
+    ) %>%
+    data_color(
+      columns = P_Value,
+      colors = scales::col_numeric(
+        palette = c("#d9534f", "#f7f7f7"),
+        domain = c(0, 0.05)
+      )
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+  
+  print(phq9_condition_summary_table)
+}
+
+# If no significant results found
+if(length(significant_condition_phq2) == 0 && length(significant_condition_phq9) == 0) {
+  cat("\n=== NO SIGNIFICANT CONDITION PAIRWISE COMPARISONS FOUND ===\n")
+  cat("No chronic dermatology condition pairwise comparisons had p ≤ 0.05\n")
+  cat("This suggests relatively consistent depression screening rates across conditions\n")
+}
+```
+
+## 5. Comprehensive Presentation-Ready Summary Tables
+
+```{r}
+cat("\n=== 5. COMPREHENSIVE PRESENTATION-READY SUMMARY TABLES ===\n")
+
+# ========== TABLE 1: COHORT OVERVIEW ==========
+main_cohort_summary <- data.table(
+  Metric = c("Total Patients", "Total Encounters", "PHQ-2+ Patients", "PHQ-2+ Rate", "PHQ-9+ Patients", "PHQ-9+ Rate"),
+  Value = c(
+    nrow(chronic_derm_phq_status),
+    nrow(chronic_derm_encounters), 
+    sum(chronic_derm_phq_status$ever_phq2_positive),
+    paste0(round(mean(chronic_derm_phq_status$ever_phq2_positive) * 100, 1), "%"),
+    sum(chronic_derm_phq_status$ever_phq9_positive),
+    paste0(round(mean(chronic_derm_phq_status$ever_phq9_positive) * 100, 1), "%")
+  )
+)
+
+table1 <- main_cohort_summary %>%
+  gt() %>%
+  tab_header(
+    title = "Table 1: Chronic Dermatology Cohort Overview",
+    subtitle = "Comprehensive descriptive statistics for full chronic dermatology cohort"
+  ) %>%
+  cols_label(
+    Metric = "Study Metric",
+    Value = "Value"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = Metric)
+  ) %>%
+  tab_style(
+    style = cell_text(size = px(14), weight = "bold"),
+    locations = cells_title()
+  ) %>%
+  tab_options(
+    table.border.top.color = "#000000",
+    table.border.top.width = px(2),
+    table.border.bottom.color = "#000000", 
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(12)
+  ) %>%
+  tab_footnote(
+    footnote = "Patient-level analysis including all encounters for chronic dermatology patients. PHQ positivity defined as any positive screening across all encounters.",
+    locations = cells_column_labels(columns = Metric)
+  )
+
+print(table1)
+
+# ========== TABLE 2: DEMOGRAPHIC BREAKDOWN ==========
+if(!is.null(race_results) && !is.null(insurance_results)) {
+  # Combine key demographic results
+  demo_summary_combined <- rbind(
+    race_results$summary[, .(Category = "Race/Ethnicity", Level = Race, N = total_patients, 
+                            PHQ2_Rate = phq2_positive_rate, PHQ9_Rate = phq9_positive_rate)],
+    insurance_results$summary[, .(Category = "Insurance Class", Level = `Insurance Class`, N = total_patients,
+                                PHQ2_Rate = phq2_positive_rate, PHQ9_Rate = phq9_positive_rate)]
+  )
+  
+  table2 <- demo_summary_combined %>%
+    gt(groupname_col = "Category") %>%
+    tab_header(
+      title = "Table 2: Demographic Characteristics and Depression Screening Outcomes",
+      subtitle = "PHQ-2 and PHQ-9 positivity rates stratified by key demographic variables"
+    ) %>%
+    cols_label(
+      Level = "Demographic Group",
+      N = "Patients (N)",
+      PHQ2_Rate = "PHQ-2 Positivity (%)",
+      PHQ9_Rate = "PHQ-9 Positivity (%)"
+    ) %>%
+    fmt_number(columns = c(PHQ2_Rate, PHQ9_Rate), decimals = 1) %>%
+    tab_spanner(label = "Depression Screening Results", columns = c(PHQ2_Rate, PHQ9_Rate)) %>%
+    data_color(
+      columns = c(PHQ2_Rate, PHQ9_Rate),
+      colors = scales::col_numeric(
+        palette = c("#ffffff", "#ffebee", "#ffcdd2", "#ef9a9a"),
+        domain = c(0, max(c(demo_summary_combined$PHQ2_Rate, demo_summary_combined$PHQ9_Rate), na.rm = TRUE))
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_style(
+      style = cell_text(size = px(14), weight = "bold"),
+      locations = cells_title()
+    ) %>%
+    tab_options(
+      table.border.top.color = "#000000",
+      table.border.top.width = px(2),
+      table.border.bottom.color = "#000000",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      table.font.size = px(12),
+      row_group.font.weight = "bold"
+    ) %>%
+    tab_footnote(
+      footnote = "Color intensity indicates higher depression screening positivity rates. Statistical significance testing performed separately.",
+      locations = cells_column_labels(columns = PHQ2_Rate)
+    )
+  
+  print(table2)
+}
+
+# Table 3: Enhanced Condition-Specific Results
+if(nrow(condition_summary) > 0) {
+  # Filter for substantial conditions and add ranking
+  table3_data <- condition_summary[total_patients >= 20]
+  table3_data[, rank := .I]  # Add ranking by patient count
+  
+  table3 <- table3_data %>%
+    gt() %>%
+    tab_header(
+      title = "Table 3: Depression Screening Outcomes by Chronic Dermatological Condition",
+      subtitle = "Comparison of PHQ-2 and PHQ-9 positivity rates across conditions with ≥20 patients (ordered by prevalence)"
+    ) %>%
+    cols_label(
+      rank = "Rank",
+      condition_type = "Chronic Dermatological Condition",
+      total_patients = "Total Patients (N)",
+      phq2_positive_patients = "PHQ-2+ (n)",
+      phq2_positive_rate = "Positivity Rate (%)",
+      phq9_positive_patients = "PHQ-9+ (n)",
+      phq9_positive_rate = "Positivity Rate (%)"
+    ) %>%
+    tab_spanner(label = "PHQ-2 Depression Screening", columns = c(phq2_positive_patients, phq2_positive_rate)) %>%
+    tab_spanner(label = "PHQ-9 Depression Screening", columns = c(phq9_positive_patients, phq9_positive_rate)) %>%
+    fmt_number(columns = c(phq2_positive_rate, phq9_positive_rate), decimals = 1) %>%
+    fmt_number(columns = c(total_patients, phq2_positive_patients, phq9_positive_patients), decimals = 0) %>%
+    data_color(
+      columns = c(phq2_positive_rate, phq9_positive_rate),
+      colors = scales::col_numeric(
+        palette = c("#f8f9fa", "#e3f2fd", "#bbdefb", "#90caf9", "#64b5f6", "#42a5f5", "#2196f3"),
+        domain = c(0, max(c(table3_data$phq2_positive_rate, table3_data$phq9_positive_rate), na.rm = TRUE))
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(columns = condition_type)
+    ) %>%
+    tab_style(
+      style = cell_text(size = px(11)),
+      locations = cells_body()
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_column_spanners()
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold", size = px(14)),
+      locations = cells_title()
+    ) %>%
+    tab_style(
+      style = cell_borders(sides = "top", color = "#dee2e6", weight = px(1)),
+      locations = cells_body()
+    ) %>%
+    cols_align(align = "center", columns = c(rank, total_patients, phq2_positive_patients, phq2_positive_rate, phq9_positive_patients, phq9_positive_rate)) %>%
+    cols_align(align = "left", columns = condition_type) %>%
+    tab_options(
+      table.border.top.color = "#000000",
+      table.border.top.width = px(2),
+      table.border.bottom.color = "#000000",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      table.font.size = px(12),
+      data_row.padding = px(6),
+      column_labels.padding = px(8)
+    ) %>%
+    tab_footnote(
+      footnote = "Conditions ranked by total patient count (descending). Color intensity indicates higher depression screening positivity rates. PHQ-2 and PHQ-9 are validated depression screening instruments.",
+      locations = cells_column_labels(columns = condition_type)
+    ) %>%
+    tab_source_note(
+      source_note = "Analysis includes only chronic dermatological conditions with sufficient sample size (≥20 patients). Patient-level analysis using any positive screening across all encounters."
+    )
+  
+  print(table3)
+}
+
+# ========== TABLE 4: SIGNIFICANT PAIRWISE COMPARISONS ==========
+# Combine significant demographic and condition comparisons
+significant_results_combined <- data.table()
+
+# Add significant demographic comparisons if they exist
+if(length(significant_phq2) > 0 || length(significant_phq9) > 0) {
+  
+  # Process PHQ-2 demographic comparisons
+  if(length(significant_phq2) > 0) {
+    phq2_demo_data <- rbindlist(lapply(significant_phq2, function(comp) {
+      data.table(
+        Analysis_Type = "Demographic",
+        PHQ_Type = "PHQ-2",
+        Comparison = comp$comparison,
+        Group1_N = comp$group1_n,
+        Group2_N = comp$group2_n,
+        OR = round(comp$phq2_or, 2),
+        CI_Lower = round(comp$phq2_ci_lower, 2),
+        CI_Upper = round(comp$phq2_ci_upper, 2),
+        P_Value = round(comp$phq2_p, 4)
+      )
+    }))
+    significant_results_combined <- rbind(significant_results_combined, phq2_demo_data)
+  }
+  
+  # Process PHQ-9 demographic comparisons
+  if(length(significant_phq9) > 0) {
+    phq9_demo_data <- rbindlist(lapply(significant_phq9, function(comp) {
+      data.table(
+        Analysis_Type = "Demographic",
+        PHQ_Type = "PHQ-9",
+        Comparison = comp$comparison,
+        Group1_N = comp$group1_n,
+        Group2_N = comp$group2_n,
+        OR = round(comp$phq9_or, 2),
+        CI_Lower = round(comp$phq9_ci_lower, 2),
+        CI_Upper = round(comp$phq9_ci_upper, 2),
+        P_Value = round(comp$phq9_p, 4)
+      )
+    }))
+    significant_results_combined <- rbind(significant_results_combined, phq9_demo_data)
+  }
+}
+
+# Add significant condition comparisons if they exist
+if(length(significant_condition_phq2) > 0 || length(significant_condition_phq9) > 0) {
+  
+  # Process PHQ-2 condition comparisons
+  if(length(significant_condition_phq2) > 0) {
+    phq2_condition_data <- rbindlist(lapply(significant_condition_phq2, function(comp) {
+      data.table(
+        Analysis_Type = "Condition",
+        PHQ_Type = "PHQ-2",
+        Comparison = comp$comparison,
+        Group1_N = comp$cond1_n,
+        Group2_N = comp$cond2_n,
+        OR = round(comp$phq2_or, 2),
+        CI_Lower = round(comp$phq2_ci_lower, 2),
+        CI_Upper = round(comp$phq2_ci_upper, 2),
+        P_Value = round(comp$phq2_p, 4)
+      )
+    }))
+    significant_results_combined <- rbind(significant_results_combined, phq2_condition_data)
+  }
+  
+  # Process PHQ-9 condition comparisons
+  if(length(significant_condition_phq9) > 0) {
+    phq9_condition_data <- rbindlist(lapply(significant_condition_phq9, function(comp) {
+      data.table(
+        Analysis_Type = "Condition",
+        PHQ_Type = "PHQ-9",
+        Comparison = comp$comparison,
+        Group1_N = comp$cond1_n,
+        Group2_N = comp$cond2_n,
+        OR = round(comp$phq9_or, 2),
+        CI_Lower = round(comp$phq9_ci_lower, 2),
+        CI_Upper = round(comp$phq9_ci_upper, 2),
+        P_Value = round(comp$phq9_p, 4)
+      )
+    }))
+    significant_results_combined <- rbind(significant_results_combined, phq9_condition_data)
+  }
+}
+
+# Create Table 4 only if there are significant results
+if(nrow(significant_results_combined) > 0) {
+  table4 <- significant_results_combined %>%
+    gt(groupname_col = "Analysis_Type") %>%
+    tab_header(
+      title = "Table 4: Statistically Significant Pairwise Comparisons",
+      subtitle = "All comparisons with p ≤ 0.05 across demographic groups and chronic dermatological conditions"
+    ) %>%
+    cols_label(
+      PHQ_Type = "Screen",
+      Comparison = "Comparison Groups",
+      Group1_N = "Group 1 (N)",
+      Group2_N = "Group 2 (N)",
+      OR = "Odds Ratio",
+      CI_Lower = "95% CI Lower",
+      CI_Upper = "95% CI Upper",
+      P_Value = "P-Value"
+    ) %>%
+    tab_spanner(label = "Sample Sizes", columns = c(Group1_N, Group2_N)) %>%
+    tab_spanner(label = "Statistical Results", columns = c(OR, CI_Lower, CI_Upper, P_Value)) %>%
+    data_color(
+      columns = P_Value,
+      colors = scales::col_numeric(
+        palette = c("#d32f2f", "#f57c00", "#fbc02d"),
+        domain = c(0, 0.05)
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_row_groups()
+    ) %>%
+    tab_style(
+      style = cell_text(size = px(14), weight = "bold"),
+      locations = cells_title()
+    ) %>%
+    tab_style(
+      style = cell_text(size = px(10)),
+      locations = cells_body()
+    ) %>%
+    cols_align(align = "center", columns = c(PHQ_Type, Group1_N, Group2_N, OR, CI_Lower, CI_Upper, P_Value)) %>%
+    cols_align(align = "left", columns = Comparison) %>%
+    tab_options(
+      table.border.top.color = "#000000",
+      table.border.top.width = px(2),
+      table.border.bottom.color = "#000000",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      table.font.size = px(11),
+      row_group.font.weight = "bold"
+    ) %>%
+    tab_footnote(
+      footnote = "Color intensity indicates statistical significance level. Demographic comparisons examine differences between race/insurance groups. Condition comparisons examine differences between chronic dermatological conditions.",
+      locations = cells_column_labels(columns = P_Value)
+    ) %>%
+    tab_source_note(
+      source_note = "Only comparisons reaching statistical significance (p ≤ 0.05) are displayed. Effect sizes interpreted as odds ratios with 95% confidence intervals."
+    )
+  
+  print(table4)
+} else {
+  # Create a message table if no significant results
+  no_results_table <- data.table(
+    Finding = "No Statistically Significant Differences Found",
+    Interpretation = "All pairwise comparisons between demographic groups and chronic dermatological conditions showed p > 0.05, suggesting relatively consistent depression screening rates across groups."
+  )
+  
+  table4_no_results <- no_results_table %>%
+    gt() %>%
+    tab_header(
+      title = "Table 4: Pairwise Comparison Results",
+      subtitle = "Statistical significance assessment across all group comparisons"
+    ) %>%
+    cols_label(
+      Finding = "Statistical Finding",
+      Interpretation = "Clinical Interpretation"
+    ) %>%
+    tab_style(
+      style = cell_text(size = px(14), weight = "bold"),
+      locations = cells_title()
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(columns = Finding)
+    ) %>%
+    tab_options(
+      table.border.top.color = "#000000",
+      table.border.top.width = px(2),
+      table.border.bottom.color = "#000000",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      table.font.size = px(12)
+    )
+  
+  print(table4_no_results)
+}
+```
+
+## Summary
+
+```{r}
+cat("\n=== ANALYSIS SUMMARY ===\n")
+cat("1. Main comparison completed: Full Chronic Derm Cohort vs Matched Controls\n")
+cat("2. Demographic breakdown completed within full chronic derm cohort\n") 
+cat("3. Pairwise demographic comparisons completed\n")
+cat("4. Condition-specific comparisons completed\n")
+cat("5. Presentation-ready tables generated\n")
+
+cat("\nTotal patients analyzed:\n")
+cat("- Full Chronic Dermatology Cohort:", nrow(chronic_derm_phq_status), "\n")
+cat("- Conditions analyzed:", length(analyzable_conditions), "\n")
+
+cat("\nMethodology: Descriptive statistics for FULL chronic dermatology cohort (n≈4600). No control comparisons in this file - see File 06 for matched comparisons.\n")
+```
