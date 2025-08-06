@@ -271,16 +271,11 @@ chronic_pattern <- paste(all_chronic_codes, collapse = "|")
 # --- define chronic derm cohort based on ICD-10 Codes ---
 chronic_derm_cohort <- result_wide[str_detect(icd10_dx, chronic_pattern)]
 
-# create derm Clinic Cohort
-derm_clinic_cohort <- result_wide[str_detect(tolower(appt_dept), "derm") & !str_detect(tolower(appt_dept), "ped")]
-
 data_path <- "Z:/Kucirek/"
 
 #save intermediate files
 saveRDS(result_wide, file.path(data_path, "result_wide.rds"))
 saveRDS(chronic_derm_cohort, file.path(data_path, "chronic_derm_cohort.rds"))
-saveRDS(derm_clinic_cohort, file.path(data_path, "derm_clinic_cohort.rds"))
-
 
 cat(paste("Intermediate data files saved to:", data_path, "\n"))
 ```
