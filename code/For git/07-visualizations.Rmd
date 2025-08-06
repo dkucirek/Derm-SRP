@@ -1,0 +1,673 @@
+---
+title: "07: Visualizations"
+output: html_document
+---
+
+Publication-ready forest plots for chronic dermatology and depression screening analysis.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 12, fig.height = 8, dpi = 300)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(tidyr)
+library(epitools)
+
+data_path <- "Z:/Kucirek/"
+condition_phq_results <- readRDS(file.path(data_path, "condition_phq_results.rds"))
+setDT(condition_phq_results)
+
+cat("=== DATA LOADED ===\n")
+cat("Conditions analyzed:", nrow(condition_phq_results), "\n")
+cat("Available columns:", names(condition_phq_results), "\n")
+print(head(condition_phq_results))
+```
+
+### Figure 1: PHQ-2 Depression Screening Forest Plot
+
+```{r figure1-phq2-forest, fig.width=14, fig.height=10}
+# PHQ-2 forest plot data
+phq2_data <- condition_phq_results[!is.na(Condition_PHQ2_Rate) & !is.na(Control_PHQ2_Rate)]
+
+if (nrow(phq2_data) > 0) {
+  # rate differences, odds ratios, confidence intervals, and p-values
+  phq2_data[, Rate_Diff := Condition_PHQ2_Rate - Control_PHQ2_Rate]
+  
+  # odds ratios and confidence intervals
+  phq2_data[, c("OR", "OR_Lower", "OR_Upper", "P_Value") := {
+    results <- lapply(1:.N, function(i) {
+      # contingency table
+      contingency <- matrix(c(
+        Condition_PHQ2_Pos[i], Condition_N[i] - Condition_PHQ2_Pos[i],
+        Control_PHQ2_Pos[i], Control_N[i] - Control_PHQ2_Pos[i]
+      ), nrow = 2, byrow = TRUE)
+      
+      tryCatch({
+        # odds ratio with confidence interval using epitools
+        result <- epitools::oddsratio(contingency)
+        p_val <- chisq.test(contingency)$p.value
+        
+        list(
+          OR = result$measure[2,1],
+          OR_Lower = result$measure[2,2], 
+          OR_Upper = result$measure[2,3],
+          P_Value = p_val
+        )
+      }, error = function(e) {
+        list(OR = 1.0, OR_Lower = 1.0, OR_Upper = 1.0, P_Value = 1.0)
+      })
+    })
+    
+    data.table(
+      OR = sapply(results, function(x) x$OR),
+      OR_Lower = sapply(results, function(x) x$OR_Lower),
+      OR_Upper = sapply(results, function(x) x$OR_Upper),
+      P_Value = sapply(results, function(x) x$P_Value)
+    )
+  }]
+  
+  phq2_data[, Significant := P_Value < 0.05]
+  phq2_data[, P_Text := ifelse(P_Value < 0.001, "P<0.001", 
+                              ifelse(P_Value < 0.01, sprintf("P=%.3f", P_Value),
+                                    sprintf("P=%.2f", P_Value)))]
+  
+  # by rate difference
+  forest_data_phq2 <- phq2_data[order(-Rate_Diff)]
+  forest_data_phq2[, Condition_Label := factor(Condition, levels = Condition)]
+  
+  forest_data_phq2[, Condition_Short := stringr::str_wrap(Condition, width = 30)]
+  forest_data_phq2[, Condition_Short := factor(Condition_Short, levels = Condition_Short)]
+  
+  #  PHQ-2 forest plot with odds ratios on x-axis
+  fig1_phq2 <- ggplot(forest_data_phq2, aes(y = Condition_Short, x = OR)) +
+    #  line at OR = 1
+    geom_vline(xintercept = 1, color = "black", linewidth = 1) +
+    # Confidence intervals (error bars)
+    geom_errorbarh(aes(xmin = OR_Lower, xmax = OR_Upper, color = Significant), 
+                   height = 0.3, linewidth = 1.2) +
+    # point estimates
+    geom_point(aes(color = Significant), size = 5) +
+    
+    scale_color_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2C3E50"),
+                       name = "Significant",
+                       labels = c("TRUE" = "Yes", "FALSE" = "No")) +
+    scale_x_continuous(limits = c(min(forest_data_phq2$OR_Lower) - 0.2, 
+                                 max(forest_data_phq2$OR_Upper) + 0.2), 
+                       breaks = c(0.5, 1, 1.5, 2, 2.5, 3),
+                       name = "Odds Ratio (95% Confidence Interval)") +
+    scale_y_discrete(name = "") +
+    
+    labs(title = "Figure 1A. PHQ-2 Positivity Odds Ratios by Dermatological Condition",
+         subtitle = "Chronic dermatology patients vs propensity-matched controls") +
+    
+    theme_classic() +
+    theme(
+      text = element_text(family = "Georgia"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0, margin = margin(b = 15)),
+      plot.subtitle = element_text(size = 16, hjust = 0, margin = margin(b = 25)),
+      axis.title.x = element_text(size = 16, face = "bold", margin = margin(t = 20)),
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 15, face = "bold", margin = margin(r = 15)),
+      legend.position = "bottom",
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 13),
+      panel.grid.major.x = element_line(color = "#E2E8F0", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(30, 30, 30, 30)
+    )
+  
+  print(fig1_phq2)
+} else {
+  cat("No PHQ-2 data available for forest plot\n")
+}
+```
+
+### Figure 2: PHQ-9 Depression Screening Forest Plot
+
+```{r figure2-phq9-forest, fig.width=14, fig.height=10}
+#  PHQ-9 forest plot data
+phq9_data <- condition_phq_results[!is.na(Condition_PHQ9_Rate) & !is.na(Control_PHQ9_Rate)]
+
+if (nrow(phq9_data) > 0) {
+  #  rate differences, odds ratios, confidence intervals, and p-values
+  phq9_data[, Rate_Diff := Condition_PHQ9_Rate - Control_PHQ9_Rate]
+  
+  #  odds ratios and confidence intervals
+  phq9_data[, c("OR", "OR_Lower", "OR_Upper", "P_Value") := {
+    results <- lapply(1:.N, function(i) {
+      #  contingency table
+      contingency <- matrix(c(
+        Condition_PHQ9_Pos[i], Condition_N[i] - Condition_PHQ9_Pos[i],
+        Control_PHQ9_Pos[i], Control_N[i] - Control_PHQ9_Pos[i]
+      ), nrow = 2, byrow = TRUE)
+      
+      tryCatch({
+        #  odds ratio with confidence interval
+        result <- epitools::oddsratio(contingency)
+        p_val <- chisq.test(contingency)$p.value
+        
+        list(
+          OR = result$measure[2,1],
+          OR_Lower = result$measure[2,2], 
+          OR_Upper = result$measure[2,3],
+          P_Value = p_val
+        )
+      }, error = function(e) {
+        list(OR = 1.0, OR_Lower = 1.0, OR_Upper = 1.0, P_Value = 1.0)
+      })
+    })
+    
+    data.table(
+      OR = sapply(results, function(x) x$OR),
+      OR_Lower = sapply(results, function(x) x$OR_Lower),
+      OR_Upper = sapply(results, function(x) x$OR_Upper),
+      P_Value = sapply(results, function(x) x$P_Value)
+    )
+  }]
+  
+  phq9_data[, Significant := P_Value < 0.05]
+  phq9_data[, P_Text := ifelse(P_Value < 0.001, "P<0.001", 
+                              ifelse(P_Value < 0.01, sprintf("P=%.3f", P_Value),
+                                    sprintf("P=%.2f", P_Value)))]
+  
+  #  by rate difference
+  forest_data_phq9 <- phq9_data[order(-Rate_Diff)]
+  forest_data_phq9[, Condition_Label := factor(Condition, levels = Condition)]
+  
+  forest_data_phq9[, Condition_Short := stringr::str_wrap(Condition, width = 30)]
+  forest_data_phq9[, Condition_Short := factor(Condition_Short, levels = Condition_Short)]
+  
+  #  PHQ-9 forest plot with odds ratios on x-axis
+  fig2_phq9 <- ggplot(forest_data_phq9, aes(y = Condition_Short, x = OR)) +
+    # reference line at OR = 1
+    geom_vline(xintercept = 1, color = "black", linewidth = 1) +
+    # confidence intervals (error bars)
+    geom_errorbarh(aes(xmin = OR_Lower, xmax = OR_Upper, color = Significant), 
+                   height = 0.3, linewidth = 1.2) +
+    geom_point(aes(color = Significant), size = 5) +
+    
+    scale_color_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2C3E50"),
+                       name = "Significant",
+                       labels = c("TRUE" = "Yes", "FALSE" = "No")) +
+    scale_x_continuous(limits = c(min(forest_data_phq9$OR_Lower) - 0.2, 
+                                 max(forest_data_phq9$OR_Upper) + 0.2), 
+                       breaks = c(0.5, 1, 1.5, 2, 2.5, 3),
+                       name = "Odds Ratio (95% Confidence Interval)") +
+    scale_y_discrete(name = "") +
+    
+    labs(title = "Figure 1B. PHQ-9 Positivity Odds Ratios by Dermatological Condition",
+         subtitle = "Chronic dermatology patients vs propensity-matched controls") +
+    
+    theme_classic() +
+    theme(
+      text = element_text(family = "Georgia"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0, margin = margin(b = 15)),
+      plot.subtitle = element_text(size = 16, hjust = 0, margin = margin(b = 25)),
+      axis.title.x = element_text(size = 16, face = "bold", margin = margin(t = 20)),
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 15, face = "bold", margin = margin(r = 15)),
+      legend.position = "bottom",
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 13),
+      panel.grid.major.x = element_line(color = "#E2E8F0", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(30, 30, 30, 30)
+    )
+  
+  print(fig2_phq9)
+} else {
+  cat("No PHQ-9 data available for forest plot\n")
+}
+```
+
+### Figure 3: PHQ-2 Positivity Rate Comparison Bar Chart
+
+```{r figure3-phq2-bar, fig.width=12, fig.height=8}
+# PHQ-2 bar chart data
+if (nrow(phq2_data) > 0) {
+  #  comparison data for bar chart with conditional colors
+  phq2_comparison_data <- phq2_data %>%
+    select(Condition, Condition_PHQ2_Rate, Control_PHQ2_Rate, Significant) %>%
+    mutate(
+      Condition_Short = stringr::str_wrap(Condition, width = 15)
+    ) %>%
+    pivot_longer(cols = c(Condition_PHQ2_Rate, Control_PHQ2_Rate), 
+                 names_to = "Group", values_to = "Rate") %>%
+    mutate(
+      Group = factor(Group, levels = c("Control_PHQ2_Rate", "Condition_PHQ2_Rate"),
+                     labels = c("Matched Controls", "Derm Patients")),
+      Condition_Short = reorder(Condition_Short, ifelse(Group == "Derm Patients", Rate, 0), FUN = max),
+      Group_Simple = Group
+    )
+  
+  #  grouped bar chart
+  fig3_phq2 <- ggplot(phq2_comparison_data, aes(x = Condition_Short, y = Rate, fill = Group_Simple)) +
+    geom_col(position = "dodge", width = 0.7, alpha = 0.8) +
+    
+    #  significance indicators, asterisks
+    geom_text(data = phq2_data %>% 
+                filter(Significant == TRUE) %>%
+                mutate(Condition_Short = stringr::str_wrap(Condition, width = 15)),
+              aes(x = reorder(Condition_Short, Condition_PHQ2_Rate), 
+                  y = pmax(Condition_PHQ2_Rate, Control_PHQ2_Rate) + 0.8, 
+                  label = "*"),
+              inherit.aes = FALSE, size = 10, color = "#1B4F72", fontface = "bold") +
+    
+    scale_fill_manual(values = c("Matched Controls" = "#3498DB", "Derm Patients" = "#E74C3C"),
+                      name = "Patient Group") +
+    scale_y_continuous(name = "PHQ-2 Positivity Rate (%)", 
+                       limits = c(0, max(phq2_comparison_data$Rate) + 2),
+                       breaks = seq(0, ceiling(max(phq2_comparison_data$Rate)), 2)) +
+    scale_x_discrete(name = "") +
+    
+    labs(title = "Figure 3. PHQ-2 Positivity Rates by Dermatological Condition",
+         subtitle = "Comparison of dermatology patients vs propensity-matched controls") +
+    
+    theme_classic() +
+    theme(
+      text = element_text(family = "Georgia"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0, margin = margin(b = 15)),
+      plot.subtitle = element_text(size = 16, hjust = 0, margin = margin(b = 20)),
+      axis.title.y = element_text(size = 16, face = "bold", margin = margin(r = 15)),
+      axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, face = "bold", lineheight = 0.8),
+      axis.text.y = element_text(size = 13),
+      legend.position = "bottom",
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 13),
+      panel.grid.major.y = element_line(color = "#E2E8F0", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = margin(40, 30, 30, 30),
+      plot.caption = element_text(size = 12, hjust = 0.5, color = "#2C3E50", 
+                                  margin = margin(t = 15), face = "italic")
+    ) +
+    labs(caption = "* Statistically significant difference (P < 0.05)")
+  
+  print(fig3_phq2)
+} else {
+  cat("No PHQ-2 data available for bar chart\n")
+}
+```
+
+### Figure 4: PHQ-9 Positivity Rate Comparison Bar Chart
+
+```{r figure4-phq9-bar, fig.width=12, fig.height=8}
+#  PHQ-9 bar chart data
+if (nrow(phq9_data) > 0) {
+  #  comparison data for bar chart with conditional colors
+  phq9_comparison_data <- phq9_data %>%
+    select(Condition, Condition_PHQ9_Rate, Control_PHQ9_Rate, Significant) %>%
+    mutate(
+      Condition_Short = stringr::str_wrap(Condition, width = 15)
+    ) %>%
+    pivot_longer(cols = c(Condition_PHQ9_Rate, Control_PHQ9_Rate), 
+                 names_to = "Group", values_to = "Rate") %>%
+    mutate(
+      Group = factor(Group, levels = c("Control_PHQ9_Rate", "Condition_PHQ9_Rate"),
+                     labels = c("Matched Controls", "Derm Patients")),
+      Condition_Short = reorder(Condition_Short, ifelse(Group == "Derm Patients", Rate, 0), FUN = max),
+      #  group variable for coloring
+      Group_Simple = Group
+    )
+  
+  #  grouped bar chart
+  fig4_phq9 <- ggplot(phq9_comparison_data, aes(x = Condition_Short, y = Rate, fill = Group_Simple)) +
+    geom_col(position = "dodge", width = 0.7, alpha = 0.8) +
+    
+    #  significance indicators - asterisks
+    geom_text(data = phq9_data %>% 
+                filter(Significant == TRUE) %>%
+                mutate(Condition_Short = stringr::str_wrap(Condition, width = 15)),
+              aes(x = reorder(Condition_Short, Condition_PHQ9_Rate), 
+                  y = pmax(Condition_PHQ9_Rate, Control_PHQ9_Rate) + 0.8, 
+                  label = "*"),
+              inherit.aes = FALSE, size = 10, color = "#1B4F72", fontface = "bold") +
+    
+    scale_fill_manual(values = c("Matched Controls" = "#3498DB", "Derm Patients" = "#E74C3C"),
+                      name = "Patient Group") +
+    scale_y_continuous(name = "PHQ-9 Positivity Rate (%)", 
+                       limits = c(0, max(phq9_comparison_data$Rate) + 2),
+                       breaks = seq(0, ceiling(max(phq9_comparison_data$Rate)), 2)) +
+    scale_x_discrete(name = "") +
+    
+    labs(title = "Figure 4. PHQ-9 Positivity Rates by Dermatological Condition",
+         subtitle = "Comparison of dermatology patients vs propensity-matched controls") +
+    
+    theme_classic() +
+    theme(
+      text = element_text(family = "Georgia"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0, margin = margin(b = 15)),
+      plot.subtitle = element_text(size = 16, hjust = 0, margin = margin(b = 20)),
+      axis.title.y = element_text(size = 16, face = "bold", margin = margin(r = 15)),
+      axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, face = "bold", lineheight = 0.8),
+      axis.text.y = element_text(size = 13),
+      legend.position = "bottom",
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 13),
+      panel.grid.major.y = element_line(color = "#E2E8F0", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = margin(40, 30, 30, 30),
+      plot.caption = element_text(size = 12, hjust = 0.5, color = "#2C3E50", 
+                                  margin = margin(t = 15), face = "italic")
+    ) +
+    labs(caption = "* Statistically significant difference (P < 0.05)")
+  
+  print(fig4_phq9)
+} else {
+  cat("No PHQ-9 data available for bar chart\n")
+}
+```
+
+### Individual Condition Comparisons: Top 5 Most Significant PHQ-9 Conditions
+
+```{r individual-top5-phq9-setup}
+# id top 5 most significant PHQ-9 conditions
+if (exists("phq9_data") && nrow(phq9_data) > 0) {
+  top5_phq9_conditions <- phq9_data[order(P_Value)][1:5]
+  cat("Top 5 most significant PHQ-9 conditions:\n")
+  print(top5_phq9_conditions[, .(Condition, P_Value, Significant)])
+} else {
+  top5_phq9_conditions <- data.table()
+}
+```
+
+```{r individual-phq9-plots, fig.width=8, fig.height=6}
+if (nrow(top5_phq9_conditions) > 0) {
+  
+  # individual PHQ-9 plots for each 
+  individual_phq9_plots <- list()
+  
+  for (i in 1:nrow(top5_phq9_conditions)) {
+    condition_data <- top5_phq9_conditions[i]
+    
+    #  comparison data for PHQ-9 with conditional colors
+    comparison_data <- data.frame(
+      Group = c("Matched Controls", "Derm Patients"),
+      Rate = c(condition_data$Control_PHQ9_Rate, condition_data$Condition_PHQ9_Rate),
+      Condition = condition_data$Condition,
+      P_Value = condition_data$P_Value,
+      Significant = condition_data$Significant,
+      Group_Sig = if(condition_data$Significant) c("Sig Controls", "Sig Derm") else c("Non-sig Controls", "Non-sig Derm")
+    )
+    y_label <- "PHQ-9 Positivity Rate (%)"
+    
+    condition_short <- condition_data$Condition
+    
+    #  individual plot with conditional coloring
+    p <- ggplot(comparison_data, aes(x = Group, y = Rate, fill = Group_Sig)) +
+      geom_col(width = 0.6, alpha = 0.8) +
+      geom_text(aes(label = sprintf("%.1f%%", Rate)), 
+                vjust = -0.5, size = 6, fontface = "bold") +
+      
+      #  significance indicator if significant, asterisk
+      {if(condition_data$Significant) {
+        geom_text(x = 1.5, y = max(comparison_data$Rate) + 1, 
+                  label = "*", 
+                  size = 12, color = "#1B4F72", fontface = "bold")
+      }} +
+      
+      scale_fill_manual(values = c("Sig Controls" = "#5DADE2", "Sig Derm" = "#1B4F72",
+                                   "Non-sig Controls" = "#BDC3C7", "Non-sig Derm" = "#95A5A6")) +
+      scale_y_continuous(name = y_label, 
+                         limits = c(0, max(comparison_data$Rate) + 2),
+                         breaks = seq(0, ceiling(max(comparison_data$Rate)), 2)) +
+      scale_x_discrete(name = "") +
+      
+      labs(title = stringr::str_wrap(paste("Figure", 4 + i, ".", condition_short), width = 60),
+           subtitle = "PHQ-9 positivity: Condition vs matched controls") +
+      
+      theme_classic() +
+      theme(
+        text = element_text(family = "Georgia"),
+        plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+        plot.subtitle = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
+        axis.title.y = element_text(size = 14, face = "bold", margin = margin(r = 15)),
+        axis.text.x = element_text(size = 13, face = "bold"),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(color = "#E2E8F0", linewidth = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(20, 20, 20, 20)
+      )
+    
+    # store plot and print it
+    individual_phq9_plots[[i]] <- p
+    print(p)
+    
+    cat("\n")
+  }
+  
+} else {
+  cat("No PHQ-9 data available for individual condition plots\n")
+}
+```
+
+### Individual Condition Comparisons: Top 5 Most Significant PHQ-2 Conditions
+
+```{r individual-top5-phq2-setup}
+# id top 5 most significant PHQ-2 conditions
+if (exists("phq2_data") && nrow(phq2_data) > 0) {
+  top5_phq2_conditions <- phq2_data[order(P_Value)][1:5]
+  cat("Top 5 most significant PHQ-2 conditions:\n")
+  print(top5_phq2_conditions[, .(Condition, P_Value, Significant)])
+} else {
+  top5_phq2_conditions <- data.table()
+}
+```
+
+```{r individual-phq2-plots, fig.width=8, fig.height=6}
+if (nrow(top5_phq2_conditions) > 0) {
+  
+  #  individual PHQ-2 plots for each of the top 5 conditions
+  individual_phq2_plots <- list()
+  
+  for (i in 1:nrow(top5_phq2_conditions)) {
+    condition_data <- top5_phq2_conditions[i]
+    
+    #  comparison data for PHQ-2 with conditional colors
+    comparison_data <- data.frame(
+      Group = c("Matched Controls", "Derm Patients"),
+      Rate = c(condition_data$Control_PHQ2_Rate, condition_data$Condition_PHQ2_Rate),
+      Condition = condition_data$Condition,
+      P_Value = condition_data$P_Value,
+      Significant = condition_data$Significant,
+      Group_Sig = if(condition_data$Significant) c("Sig Controls", "Sig Derm") else c("Non-sig Controls", "Non-sig Derm")
+    )
+    y_label <- "PHQ-2 Positivity Rate (%)"
+    
+    condition_short <- condition_data$Condition
+    
+    #  individual plot with conditional coloring
+    p <- ggplot(comparison_data, aes(x = Group, y = Rate, fill = Group_Sig)) +
+      geom_col(width = 0.6, alpha = 0.8) +
+      geom_text(aes(label = sprintf("%.1f%%", Rate)), 
+                vjust = -0.5, size = 6, fontface = "bold") +
+      
+      #  significance indicator if significant, asterisk
+      {if(condition_data$Significant) {
+        geom_text(x = 1.5, y = max(comparison_data$Rate) + 1, 
+                  label = "*", 
+                  size = 12, color = "#1B4F72", fontface = "bold")
+      }} +
+      
+      scale_fill_manual(values = c("Sig Controls" = "#5DADE2", "Sig Derm" = "#1B4F72",
+                                   "Non-sig Controls" = "#BDC3C7", "Non-sig Derm" = "#95A5A6")) +
+      scale_y_continuous(name = y_label, 
+                         limits = c(0, max(comparison_data$Rate) + 2),
+                         breaks = seq(0, ceiling(max(comparison_data$Rate)), 2)) +
+      scale_x_discrete(name = "") +
+      
+      labs(title = stringr::str_wrap(paste("Figure", 9 + i, ".", condition_short), width = 60),
+           subtitle = "PHQ-2 positivity: Condition vs matched controls") +
+      
+      theme_classic() +
+      theme(
+        text = element_text(family = "Georgia"),
+        plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+        plot.subtitle = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
+        axis.title.y = element_text(size = 14, face = "bold", margin = margin(r = 15)),
+        axis.text.x = element_text(size = 13, face = "bold"),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(color = "#E2E8F0", linewidth = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(20, 20, 20, 20)
+      )
+    
+    # Store plot and print it
+    individual_phq2_plots[[i]] <- p
+    print(p)
+    
+    cat("\n")
+  }
+  
+} else {
+  cat("No PHQ-2 data available for individual condition plots\n")
+}
+```
+
+### Overall Chronic Dermatology Cohort Comparison
+
+```{r overall-cohort-comparison, fig.width=10, fig.height=7}
+
+#  overall cohort rates by aggregating individual condition data
+if ((exists("phq2_data") && nrow(phq2_data) > 0) || (exists("phq9_data") && nrow(phq9_data) > 0)) {
+  
+  overall_results <- data.frame()
+  
+  #  PHQ-2 overall rates if available
+  if (exists("phq2_data") && nrow(phq2_data) > 0) {
+    #  all condition and control counts for PHQ-2
+    total_condition_n <- sum(phq2_data$Condition_N, na.rm = TRUE)
+    total_control_n <- sum(phq2_data$Control_N, na.rm = TRUE) 
+    total_condition_phq2_pos <- sum(phq2_data$Condition_PHQ2_Pos, na.rm = TRUE)
+    total_control_phq2_pos <- sum(phq2_data$Control_PHQ2_Pos, na.rm = TRUE)
+    
+    #  overall rates
+    overall_condition_phq2_rate <- (total_condition_phq2_pos / total_condition_n) * 100
+    overall_control_phq2_rate <- (total_control_phq2_pos / total_control_n) * 100
+    
+    #  chi-square test for overall PHQ-2
+    phq2_contingency <- matrix(c(
+      total_condition_phq2_pos, total_condition_n - total_condition_phq2_pos,
+      total_control_phq2_pos, total_control_n - total_control_phq2_pos
+    ), nrow = 2, byrow = TRUE)
+    
+    phq2_test <- chisq.test(phq2_contingency)
+    
+    overall_results <- rbind(overall_results, data.frame(
+      Measure = "PHQ-2",
+      Condition_Rate = overall_condition_phq2_rate,
+      Control_Rate = overall_control_phq2_rate,
+      P_Value = phq2_test$p.value,
+      Significant = phq2_test$p.value < 0.05
+    ))
+  }
+  
+  #  PHQ-9 overall rates if available
+  if (exists("phq9_data") && nrow(phq9_data) > 0) {
+    #  all condition and control counts for PHQ-9
+    total_condition_n <- sum(phq9_data$Condition_N, na.rm = TRUE)
+    total_control_n <- sum(phq9_data$Control_N, na.rm = TRUE)
+    total_condition_phq9_pos <- sum(phq9_data$Condition_PHQ9_Pos, na.rm = TRUE)
+    total_control_phq9_pos <- sum(phq9_data$Control_PHQ9_Pos, na.rm = TRUE)
+    
+    #  overall rates
+    overall_condition_phq9_rate <- (total_condition_phq9_pos / total_condition_n) * 100
+    overall_control_phq9_rate <- (total_control_phq9_pos / total_control_n) * 100
+    
+    #  chi-square test for overall PHQ-9
+    phq9_contingency <- matrix(c(
+      total_condition_phq9_pos, total_condition_n - total_condition_phq9_pos,
+      total_control_phq9_pos, total_control_n - total_control_phq9_pos
+    ), nrow = 2, byrow = TRUE)
+    
+    phq9_test <- chisq.test(phq9_contingency)
+    
+    overall_results <- rbind(overall_results, data.frame(
+      Measure = "PHQ-9",
+      Condition_Rate = overall_condition_phq9_rate,
+      Control_Rate = overall_control_phq9_rate,
+      P_Value = phq9_test$p.value,
+      Significant = phq9_test$p.value < 0.05
+    ))
+  }
+  
+  #  comparison data for plotting
+  if (nrow(overall_results) > 0) {
+    comparison_data <- overall_results %>%
+      pivot_longer(cols = c(Condition_Rate, Control_Rate), 
+                   names_to = "Group", values_to = "Rate") %>%
+      mutate(
+        Group = factor(Group, levels = c("Control_Rate", "Condition_Rate"),
+                       labels = c("Matched Controls", "Chronic Derm Patients"))
+      )
+    
+    #  overall comparison plot
+    overall_plot <- ggplot(comparison_data, aes(x = Measure, y = Rate, fill = Group)) +
+      geom_col(position = "dodge", width = 0.6, alpha = 0.8) +
+      geom_text(aes(label = sprintf("%.1f%%", Rate)), 
+                position = position_dodge(width = 0.6), 
+                vjust = -0.5, size = 5.5, fontface = "bold") +
+      
+      #  significance indicators
+      geom_text(data = overall_results %>% 
+                  filter(Significant == TRUE),
+                aes(x = Measure, y = pmax(Condition_Rate, Control_Rate) + 1, 
+                    label = "*"),
+                inherit.aes = FALSE, size = 12, color = "#E74C3C", fontface = "bold") +
+      
+      scale_fill_manual(values = c("Matched Controls" = "#3498DB", "Chronic Derm Patients" = "#E74C3C"),
+                        name = "Patient Group") +
+      scale_y_continuous(name = "Depression Screening Positivity Rate (%)", 
+                         limits = c(0, max(comparison_data$Rate) + 2),
+                         breaks = seq(0, ceiling(max(comparison_data$Rate)), 2)) +
+      scale_x_discrete(name = "") +
+      
+      labs(title = "Figure 15. Overall Chronic Dermatology Cohort Depression Screening Results",
+           subtitle = "Aggregated results: All chronic dermatology patients vs propensity-matched controls",
+           caption = "* indicates statistically significant difference (P<0.05)") +
+      
+      theme_classic() +
+      theme(
+        text = element_text(family = "Georgia"),
+        plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+        plot.subtitle = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
+        plot.caption = element_text(size = 12, hjust = 0.5, color = "#4A5568", margin = margin(t = 10)),
+        axis.title.y = element_text(size = 14, face = "bold", margin = margin(r = 15)),
+        axis.title.x = element_text(size = 14, face = "bold", margin = margin(t = 15)),
+        axis.text.x = element_text(size = 13, face = "bold"),
+        axis.text.y = element_text(size = 12),
+        legend.position = "bottom",
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        panel.grid.major.y = element_line(color = "#E2E8F0", linewidth = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(25, 25, 25, 25)
+      )
+    
+    print(overall_plot)
+    
+    # print summary statistics
+    cat("\n=== OVERALL CHRONIC DERMATOLOGY COHORT RESULTS ===\n")
+    print(overall_results)
+    
+  } else {
+    cat("No data available for overall cohort comparison\n")
+  }
+  
+} else {
+  cat("No PHQ data available for overall cohort comparison\n")
+}
+```
