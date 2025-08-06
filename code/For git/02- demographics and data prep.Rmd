@@ -1,0 +1,200 @@
+---
+title: "02: Demographic and Data Preparation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(gtsummary)
+library(stringr)
+library(dplyr)
+library(gt)
+
+#Configuration
+data_path <- "Z:/Kucirek/"
+
+#load
+result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
+setDT(result_wide)
+
+#check that columns from 01 exist
+required_cols <- c("phq2_manual_posneg", "phq9_manual_sum")
+missing_cols <- setdiff(required_cols, names(result_wide))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Error: The following required columns are missing from result_wide.rds:", 
+             paste(missing_cols, collapse = ", "), 
+             "\nPlease re-run '01_joining_and_cohort_definition.Rmd' to regenerate the data files."))
+}
+```
+
+### Create `result_info`
+
+```{r}
+#make result_info by merging result_wide with demo_data 
+result_info <- unique(result_wide[, .(mrn_deid, age_at_encounter, fin_class, race, ethnic, sex)], by = "mrn_deid")
+
+#standardize fin_class categories 
+result_info[, fin_class := str_to_title(fin_class)]
+result_info[fin_class == "Comercial", fin_class := "Commercial"]
+
+# put small insurance classes into 'other'
+result_info[, fin_class := fcase(
+  fin_class %in% c("Ppo", "Hmo/Pos", "Miscellaneous", "Commercial", "", "Grants & Funds"), "Other",
+  default = fin_class
+)]
+
+result_info[, ethnic_refined := fcase(
+  ethnic == "Mexican, Mexican American, or Chicano/a", "Mexican / Chicano",
+  ethnic %in% c("Hispanic or Latino", "Puerto Rican", "Cuban", "Other Hispanic, Latino/a, or Spanish origin"), "Other Hispanic / Latino",
+  ethnic == "Not Hispanic, Latino/a, or Spanish origin", "Not Hispanic / Latino",
+  ethnic == "Patient declines to respond", "Patient Declined",
+  ethnic == "Unknown or Patient unable to respond", "Unknown / Other",
+  default = "Unknown / Other"
+)]
+
+result_info[, race_refined := fcase(
+  race %in% c("Asian Indian", "Asian/Mideast Indian"), "South Asian",
+  race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese"), "East/Other Asian",
+  race == "White", "White",
+  race == "Black or African-American", "Black or African American",
+  race %in% c("Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan"), "Native Hawaiian / Pacific Islander",
+  race == "American Indian or Alaska Native", "American Indian / Alaska Native",
+  race == "More than one Race", "More than one Race",
+  race %in% c("None of the above", "Other"), "Other",
+  race %in% c("Patient declines to respond", "Unknown or Patient unable to respond"), "Declined / Unknown",
+  default = "Other"
+)]
+
+# save result_info.rds 
+saveRDS(result_info, file.path(data_path, "result_info.rds"))
+cat(paste("result_info.rds saved to:", data_path, "\n"))
+```
+
+### Prepare Data for Propensity Score Matching
+
+```{r}
+# load 
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+setDT(chronic_derm_cohort)
+
+# define chronic derm patients 
+chronic_derm_mrns <- unique(chronic_derm_cohort$mrn_deid)
+
+# make patient-level dataset with covariates
+patient_data_for_matching <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)]
+patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_mrns]
+
+# prepare covariates
+patient_data_for_matching[, sex := factor(sex)]
+patient_data_for_matching[, race_refined := factor(race_refined)]
+patient_data_for_matching[, ethnic_refined := factor(ethnic_refined)]
+patient_data_for_matching[, fin_class := factor(fin_class)]
+
+# calculate approximate number of visits
+patient_visits <- result_wide[, .N, by = mrn_deid]
+setnames(patient_visits, "N", "num_visits")
+
+# id preexisting psych care
+psych_patterns <- c("BEHAVIORAL", "COLLABORATIVE", "PSYCH", "KOVLER", "MENTAL HEALTH", "COUNSELING") # Added broader terms
+psych_regex <- paste(psych_patterns, collapse = "|")
+
+# id all psych encounters and their dates
+all_psych_encounters <- result_wide[str_detect(toupper(appt_dept), psych_regex)]
+
+# get first psych visit date per patient
+first_psych_dates <- all_psych_encounters[, .(first_psych_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
+
+# get first derm clinic visit date per patient
+first_derm_dates <- derm_clinic_cohort[, .(first_derm_clinic_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
+
+# merge psych and derm first visit dates
+patient_first_visits <- merge(first_psych_dates, first_derm_dates, by = "mrn_deid", all.x = TRUE, all.y = TRUE)
+
+# define has_psych_condition based on timing--needs behavioral care visit before derm
+patient_first_visits[, has_psych_condition_timed := !is.na(first_psych_visit) & !is.na(first_derm_clinic_visit) & (first_psych_visit < first_derm_clinic_visit)]
+patient_first_visits[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
+
+# merge num_visits and has_psych_condition_timed into patient_data_for_matching
+patient_data_for_matching <- merge(patient_data_for_matching, patient_visits, by = "mrn_deid", all.x = TRUE)
+patient_data_for_matching <- merge(patient_data_for_matching, patient_first_visits[, .(mrn_deid, has_psych_condition_timed)], by = "mrn_deid", all.x = TRUE)
+
+#make sure has_psych_condition is always present and correctly factored
+patient_data_for_matching[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
+patient_data_for_matching[, has_psych_condition := factor(has_psych_condition_timed, levels = c(FALSE, TRUE))]
+
+# get all unique department names that matched the psych patterns (for reporting)
+all_matched_dept_names <- unique(all_psych_encounters$appt_dept)
+matched_dept_names_output_path <- file.path(data_path, "matched_psych_department_names.csv")
+fwrite(data.table(matched_dept_name = all_matched_dept_names), matched_dept_names_output_path)
+cat(paste0("List of matched psychiatric department names saved to: ", matched_dept_names_output_path, "\n"))
+
+initial_rows <- nrow(patient_data_for_matching)
+patient_data_for_matching <- na.omit(patient_data_for_matching, cols = c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class", "num_visits", "has_psych_condition"))
+cat(paste0("Removed ", initial_rows - nrow(patient_data_for_matching), " rows due to missing covariate data.\n"))
+
+# make sure column names are clean 
+current_names <- names(patient_data_for_matching)
+for (col_name in c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class")) {
+  if (paste0(col_name, ".y") %in% current_names) {
+    setnames(patient_data_for_matching, paste0(col_name, ".y"), col_name)
+  }
+}
+
+# save data
+output_prepared_data_rds <- file.path(data_path, "patient_data_for_matching.rds")
+saveRDS(patient_data_for_matching, output_prepared_data_rds)
+
+cat(paste("Prepared data for propensity score matching saved to:", output_prepared_data_rds, "\n"))
+
+cat("Summary of prepared data:\n")
+print(patient_data_for_matching[, .N, by = is_chronic_derm])
+
+```
+
+### Analyze Specific Chronic Derm ICD Codes
+
+```{r}
+icd_codes_of_interest <- c(
+  "L66",   # Cicatricial alopecia
+  "L70",   # Acne
+  "L20",   # Atopic dermatitis
+  "L73.2", # Hidradenitis suppurativa
+  "L71",   # Rosacea
+  "L80",   # Vitiligo
+  "L63",   # Alopecia areata
+  "L40",   # Psoriasis
+  "L93",   # Lupus erythematosus
+  "M32.9", # Systemic lupus erythematosus, unspecified
+  "M32.1"  # Systemic lupus erythematosus, other
+)
+
+pattern <- paste0("^( ", paste(icd_codes_of_interest, collapse = "|"), ")")
+
+filtered_encounters <- result_wide[str_detect(icd10_dx, pattern)]
+
+# summarize, show results 
+if (nrow(filtered_encounters) > 0) {
+  filtered_encounters[, icd_category := str_extract(icd10_dx, pattern)]
+
+  icd_counts <- filtered_encounters[, .N, by = icd_category][order(-N)]
+
+  results_list <- filtered_encounters[, .(
+    mrn_deid,
+    icd_category,
+    icd10_dx,
+    icd_diagnosis,
+    appt_dept
+  )]
+
+  #save to CSV
+  output_file <- "specific_icd_encounters.csv"
+  fwrite(results_list, file.path(data_path, output_file))
+}
+```
