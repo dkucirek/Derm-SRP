@@ -1,0 +1,544 @@
+---
+title: "04: Propensity Score Matching"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(lme4)
+library(stringr)
+library(MatchIt)
+library(ggplot2) #for plotting
+library(gt) # for table formatting
+library(scales) # for percentage formatting
+library(tibble) # rownames_to_column
+library(tidyr) # for full_join
+library(magrittr) # for %>%
+library(htmlwidgets) # for saving gt tables as HTML
+library(epitools) # for oddsratio function
+
+data_path <- "Z:/Kucirek/"
+
+#output paths
+output_base_path <- "C:/Users/dkucirek/Documents/Derm-SRP/"
+tables_output_path <- file.path(output_base_path, "tables")
+figures_output_path <- file.path(output_base_path, "figures")
+
+# output directories if they don't exist
+if (!dir.exists(tables_output_path)) {
+  dir.create(tables_output_path, recursive = TRUE)
+}
+if (!dir.exists(figures_output_path)) {
+  dir.create(figures_output_path, recursive = TRUE)
+}
+
+# reusable function for gt table from a 2x2 matrix
+create_comparison_table <- function(matrix, title, subtitle) {
+  or_result <- epitools::oddsratio(matrix)
+  chisq_result <- chisq.test(matrix)
+
+  df <- as.data.frame.matrix(matrix)
+  df <- tibble::rownames_to_column(df, "Group")
+  df$Total <- rowSums(matrix)
+  df$Proportion <- df$Positive / df$Total
+
+  gt(df) %>%
+    cols_label(
+      Group = "Cohort",
+      Positive = "Positive",
+      Negative = "Negative",
+      Total = "Total Patients",
+      Proportion = "Positivity Rate"
+    ) %>%
+    fmt_percent(columns = Proportion, decimals = 1) %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    tab_source_note(
+      source_note = paste0(
+        "Odds Ratio: ", round(or_result$measure[2, 1], 2),
+        " (95% CI: ", round(or_result$measure[2, 2], 2), " - ", round(or_result$measure[2, 3], 2), ")",
+        " | Chi-squared p-value: ", scales::pvalue(chisq_result$p.value)
+      )
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+}
+
+
+# load pre-processed Data
+result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+
+setDT(result_wide_all)
+setDT(chronic_derm_cohort)
+setDT(result_info)
+
+#  verify cohort size 
+cat("=== DATA VALIDATION ===\n")
+cat("Chronic dermatology cohort encounters:", nrow(chronic_derm_cohort), "\n")
+cat("Chronic dermatology unique patients:", n_distinct(chronic_derm_cohort$mrn_deid), "\n")
+cat("Total encounters in result_wide_all:", nrow(result_wide_all), "\n")
+cat("Total unique patients in result_wide_all:", n_distinct(result_wide_all$mrn_deid), "\n")
+
+# verify using correct chronic derm cohort (should be ~4000-4600 PATIENTS)
+unique_chronic_derm_patients <- n_distinct(chronic_derm_cohort$mrn_deid)
+if (unique_chronic_derm_patients < 3000) {
+  warning("WARNING: Chronic dermatology patient count appears smaller than expected. Verify you're not using washout data.")
+}
+if (unique_chronic_derm_patients >= 4000 && unique_chronic_derm_patients <= 5000) {
+  cat("✓ Chronic dermatology patient count appears correct for main analysis\n")
+} else if (unique_chronic_derm_patients > 6000) {
+  warning("WARNING: Chronic dermatology patient count appears higher than expected. This might include encounters rather than unique patients.")
+}
+
+cat("========================\n\n")
+```
+
+### Propensity Score Matching
+
+```{r}
+#load data
+patient_data_for_matching <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
+setDT(patient_data_for_matching)
+
+# estimate prop scores
+patient_data_df <- as.data.frame(patient_data_for_matching)
+
+
+if (is.logical(patient_data_df$is_chronic_derm)) {
+  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+} else {
+  patient_data_df$is_chronic_derm_numeric <- patient_data_df$is_chronic_derm
+}
+
+# perform matching
+matching_formula <- as.formula(
+  is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class + has_psych_condition
+)
+
+m_out <- matchit(
+  matching_formula,
+  data = patient_data_df,
+  method = "nearest",
+  distance = "glm",
+  caliper = 0.2,
+  replace = FALSE,
+  ratio = 20
+)
+
+#extract and save matched data
+matched_data <- match.data(m_out)
+
+# make sure 'treat' column is correctly populated
+matched_data$treat <- m_out$treat[as.numeric(row.names(matched_data))]
+
+setDT(matched_data)
+
+output_matched_data_rds <- file.path(data_path, "matched_patient_data.rds")
+saveRDS(matched_data, output_matched_data_rds)
+
+summary(m_out)
+```
+
+### Analysis of Unmatched Chronic Dermatology Patients
+
+```{r}
+# analyze unmatched chronic dermatology patients
+unmatched_treated_indices <- which(m_out$treat == 1 & m_out$weights == 0)
+matched_treated_indices <- which(m_out$treat == 1 & m_out$weights > 0)
+
+if(length(unmatched_treated_indices) > 0) {
+  
+  # get characteristics of unmatched chronic derm patients
+  unmatched_characteristics <- patient_data_df[unmatched_treated_indices, ]
+  matched_characteristics <- patient_data_df[matched_treated_indices, ]
+  
+  cat("=== ANALYSIS OF", length(unmatched_treated_indices), "UNMATCHED CHRONIC DERM PATIENTS ===\n\n")
+  
+  # propensity scores
+  cat("Propensity Score Analysis:\n")
+  cat("Unmatched patients - Mean:", round(mean(m_out$distance[unmatched_treated_indices]), 3), 
+      ", Range:", round(min(m_out$distance[unmatched_treated_indices]), 3), 
+      "to", round(max(m_out$distance[unmatched_treated_indices]), 3), "\n")
+  cat("Matched patients - Mean:", round(mean(m_out$distance[matched_treated_indices]), 3), 
+      ", Range:", round(min(m_out$distance[matched_treated_indices]), 3), 
+      "to", round(max(m_out$distance[matched_treated_indices]), 3), "\n\n")
+  
+  # age comparison
+  cat("Age Analysis:\n")
+  cat("Unmatched patients - Mean age:", round(mean(unmatched_characteristics$age_at_encounter), 1), 
+      ", Range:", round(min(unmatched_characteristics$age_at_encounter)), 
+      "to", round(max(unmatched_characteristics$age_at_encounter)), "\n")
+  cat("Matched patients - Mean age:", round(mean(matched_characteristics$age_at_encounter), 1), "\n\n")
+  
+  # detailed characteristics of each unmatched patient
+  cat("Individual Patient Characteristics:\n")
+  for(i in 1:length(unmatched_treated_indices)) {
+    idx <- unmatched_treated_indices[i]
+    patient <- patient_data_df[idx, ]
+    cat("Patient", i, ":")
+    cat(" Age =", patient$age_at_encounter)
+    cat(", Sex =", patient$sex)
+    cat(", Race =", patient$race_refined)
+    cat(", Insurance =", patient$fin_class)
+    cat(", Psych =", patient$has_psych_condition)
+    cat(", PropScore =", round(m_out$distance[idx], 3), "\n")
+  }
+  
+  cat("\n=== SUMMARY STATISTICS ===\n")
+  
+  # compare distributions
+  cat("Sex distribution (unmatched):\n")
+  print(table(unmatched_characteristics$sex))
+  
+  cat("\nRace distribution (unmatched):\n")
+  print(table(unmatched_characteristics$race_refined))
+  
+  cat("\nInsurance distribution (unmatched):\n")
+  print(table(unmatched_characteristics$fin_class))
+  
+  cat("\nPrior psych condition (unmatched):\n")
+  print(table(unmatched_characteristics$has_psych_condition))
+  
+  # look for patients with propensity scores above caliper threshold
+  high_prop_patients <- sum(m_out$distance[unmatched_treated_indices] > 0.2)
+  cat("\nPatients with propensity score > 0.2 (caliper threshold):", high_prop_patients, "out of", length(unmatched_treated_indices), "\n")
+  
+  # summary table for unmatched patients
+  unmatched_summary_df <- data.frame(
+    Patient_ID = 1:length(unmatched_treated_indices),
+    Age = unmatched_characteristics$age_at_encounter,
+    Sex = unmatched_characteristics$sex,
+    Race = unmatched_characteristics$race_refined,
+    Insurance = unmatched_characteristics$fin_class,
+    Prior_Psych = unmatched_characteristics$has_psych_condition,
+    Propensity_Score = round(m_out$distance[unmatched_treated_indices], 3)
+  )
+  
+  #  gt table for unmatched patients
+  unmatched_gt <- unmatched_summary_df %>%
+    gt() %>%
+    tab_header(
+      title = "Characteristics of Unmatched Chronic Dermatology Patients",
+      subtitle = paste("All", nrow(unmatched_summary_df), "patients that could not be matched")
+    ) %>%
+    cols_label(
+      Patient_ID = "Patient #",
+      Age = "Age",
+      Sex = "Sex",
+      Race = "Race",
+      Insurance = "Insurance",
+      Prior_Psych = "Prior Psych",
+      Propensity_Score = "Prop Score"
+    ) %>%
+    fmt_number(columns = Propensity_Score, decimals = 3) %>%
+    tab_style(
+      style = cell_fill(color = "#ffcccc"),
+      locations = cells_body(columns = Propensity_Score, rows = Propensity_Score > 0.2)
+    ) %>%
+    tab_footnote(
+      footnote = "Red highlighted propensity scores are above the 0.2 caliper threshold",
+      locations = cells_column_labels(columns = Propensity_Score)
+    ) %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+  
+  gtsave(unmatched_gt, filename = "table_unmatched_patients_modeling.html", path = tables_output_path)
+  print(unmatched_gt)
+  
+} else {
+  cat("No unmatched chronic dermatology patients found.\n")
+}
+```
+
+### Table 1a: Propensity Score Matching Balance
+
+```{r}
+# get balance summary from m_out
+balance_summary <- summary(m_out)
+
+# make balance table by combining before and after summaries.
+smd_before <- as.data.frame(balance_summary$sum.all) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, `Std. Mean Diff. (Before)` = `Std. Mean Diff.`)
+
+smd_after <- as.data.frame(balance_summary$sum.matched) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, `Std. Mean Diff. (After)` = `Std. Mean Diff.`)
+
+# join tables by the covariate names
+smd_table <- dplyr::inner_join(smd_before, smd_after, by = "Covariate")
+
+# recode covariate names for presentation
+smd_table <- smd_table %>%
+  mutate(Covariate = recode(Covariate,
+    `distance` = "Propensity Score",
+    `age_at_encounter` = "Age at Encounter",
+    `sexFemale` = "Sex: Female",
+    `sexMale` = "Sex: Male",
+    `sexUnknown` = "Sex: Unknown",
+    `race_refinedAmerican Indian / Alaska Native` = "Race: American Indian / Alaska Native",
+    `race_refinedBlack or African American` = "Race: Black or African American",
+    `race_refinedDeclined / Unknown` = "Race: Declined / Unknown",
+    `race_refinedEast/Other Asian` = "Race: East/Other Asian",
+    `race_refinedMore than one Race` = "Race: More than one Race",
+    `race_refinedNative Hawaiian / Pacific Islander` = "Race: Native Hawaiian / Pacific Islander",
+    `race_refinedOther` = "Race: Other",
+    `race_refinedSouth Asian` = "Race: South Asian",
+    `race_refinedWhite` = "Race: White",
+    `ethnic_refinedMexican / Chicano` = "Ethnicity: Mexican / Chicano",
+    `ethnic_refinedNot Hispanic / Latino` = "Ethnicity: Not Hispanic / Latino",
+    `ethnic_refinedOther Hispanic / Latino` = "Ethnicity: Other Hispanic / Latino",
+    `ethnic_refinedPatient Declined` = "Ethnicity: Patient Declined",
+    `ethnic_refinedUnknown / Other` = "Ethnicity: Unknown / Other",
+    `fin_classBlue Cross/Blue Shield` = "Insurance: Blue Cross/Blue Shield",
+    `fin_classMedicaid` = "Insurance: Medicaid",
+    `fin_classMedicare` = "Insurance: Medicare",
+    `fin_classOther` = "Insurance: Other",
+    `fin_classPrivate Payors` = "Insurance: Private Payors",
+    `fin_classSelf-Pay` = "Insurance: Self-Pay",
+    `has_psych_conditionFALSE` = "Prior Psych Care: No",
+    `has_psych_conditionTRUE` = "Prior Psych Care: Yes"
+  ))
+
+# print  table using gt for better look
+gt_smd_table <- smd_table %>%
+  gt() %>%
+  tab_header(
+    title = "Standardized Mean Differences Before and After Matching",
+    subtitle = "Absolute values of standardized mean differences for covariates"
+  ) %>%
+  fmt_number(columns = c(`Std. Mean Diff. (Before)`, `Std. Mean Diff. (After)`), decimals = 3) %>%
+  cols_align(align = "left", columns = Covariate) %>%
+  cols_align(align = "center", columns = c(`Std. Mean Diff. (Before)`, `Std. Mean Diff. (After)`)) %>%
+  tab_options(
+    table.border.top.color = "#D3D3D3",
+    table.border.bottom.color = "#D3D3D3",
+    column_labels.font.weight = "bold"
+  )
+gtsave(gt_smd_table, filename = "table1a_propensity_score_balance_modeling.html", path = tables_output_path)
+
+print(gt_smd_table)
+```
+
+### Propensity Score Distribution Plots
+
+```{r}
+# get propensity scores and treatment status before matching
+if (!is.null(m_out) && length(m_out$distance) > 0) {
+  prop_scores_before <- data.frame(
+    prop_score = m_out$distance,
+    group = ifelse(m_out$treat == 1, "Chronic Derm", "Control"),
+    matching_status = "Before Matching"
+  )
+} else {
+  prop_scores_before <- data.frame(
+    prop_score = numeric(0),
+    group = character(0),
+    matching_status = character(0)
+  )
+  message("m_out is empty or has no distance/treat data. Propensity score 'Before Matching' data will be empty.")
+}
+
+# plot_data_prop_scores with 'Before Matching' data
+plot_data_prop_scores <- prop_scores_before
+
+# Conditionally add 'After Matching' data if matches were found
+if (!is.null(matched_data) && nrow(matched_data) > 0) {
+  prop_scores_after <- data.frame(
+    prop_score = matched_data$distance,
+    group = ifelse(matched_data$treat == 1, "Chronic Derm", "Control"),
+    matching_status = "After Matching"
+  )
+  plot_data_prop_scores <- bind_rows(plot_data_prop_scores, prop_scores_after)
+} else {
+  message("No matches found. Propensity score distribution plot will only show 'Before Matching' data.")
+}
+
+# set factor levels based on what's actually present in the data
+actual_levels <- unique(plot_data_prop_scores$matching_status)
+plot_data_prop_scores$matching_status <- factor(plot_data_prop_scores$matching_status, 
+                                                levels = c("Before Matching", "After Matching")[c("Before Matching", "After Matching") %in% actual_levels])
+
+# make density plot
+if (nrow(plot_data_prop_scores) > 0) {
+  propensity_plot <- ggplot(plot_data_prop_scores, aes(x = prop_score, fill = group, color = group)) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~ matching_status, scales = "free_y") +
+    labs(title = "Propensity Score Distribution",
+         subtitle = "Distribution of propensity scores before and after matching",
+         x = "Propensity Score",
+         y = "Density",
+         fill = "Group",
+         color = "Group") +
+    scale_fill_manual(values = c("Chronic Derm" = "#E69F00", "Control" = "#56B4E9")) + # Orange and Blue
+    scale_color_manual(values = c("Chronic Derm" = "#E69F00", "Control" = "#56B4E9")) + # Orange and Blue
+    coord_cartesian(xlim = c(0, 0.2)) + # Zoom in on the x-axis to see the area of overlap more clearly
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+
+  # save  plot
+  ggsave(propensity_plot, filename = "propensity_score_distribution.png", path = figures_output_path, width = 12, height = 6)
+} else {
+  message("No data available for propensity score distribution plot in 04_modeling.Rmd. Skipping plot generation.")
+}
+
+print(propensity_plot)
+```
+
+```{r}
+#ID patients with high prop scores 
+# create df to analyze which patients are outside plot's x-axis limit.
+plot_analysis_df <- data.frame(
+  mrn_deid = patient_data_df$mrn_deid,
+  prop_score = m_out$distance,
+  is_matched = ifelse(m_out$weights > 0, TRUE, FALSE),
+  is_treated = m_out$treat == 1
+)
+
+# patients with a propensity score > 0.2
+cutoff_patients <- plot_analysis_df %>%
+  filter(prop_score > 0.2)
+
+# characteristics of cutoff patients
+cat("Summary of patients with propensity scores > 0.2 (visually excluded from the plot's main view):\n")
+
+cutoff_summary <- cutoff_patients %>%
+  group_by(is_treated, is_matched) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  mutate(
+    Group = ifelse(is_treated, "Chronic Derm", "Control"),
+    `Matching Status` = ifelse(is_matched, "Matched", "Unmatched")
+  )
+
+# Display the summary in a clean table
+cutoff_summary_table <- cutoff_summary[, c("Group", "Matching Status", "count")]
+
+# Use gt for a clean presentation
+if (nrow(cutoff_summary_table) > 0) {
+  cutoff_gt <- gt(cutoff_summary_table) %>%
+    tab_header(title = "Patients with Propensity Score > 0.2") %>%
+    cols_label(count = "Number of Patients") %>%
+    tab_options(
+      table.border.top.color = "#D3D3D3",
+      table.border.bottom.color = "#D3D3D3",
+      column_labels.font.weight = "bold"
+    )
+  gtsave(cutoff_gt, filename = "table_cutoff_patients_modeling.html", path = tables_output_path)
+  print(cutoff_gt)
+} else {
+  cat("No patients found with a propensity score greater than 0.2.\n")
+}
+
+cat("\nThis summary confirms that the patients in the 'tail' of the distribution are part of the unmatched control group.\n")
+```
+
+### Propensity Score Matching Analysis
+
+```{r}
+matched_data <- readRDS(file.path(data_path, "matched_patient_data.rds"))
+setDT(matched_data)
+
+#prep data for analysis
+matched_mrns <- unique(matched_data$mrn_deid)
+outcome_data <- result_wide_all[mrn_deid %in% matched_mrns]
+
+outcome_data <- merge(outcome_data, matched_data[, .(mrn_deid, is_chronic_derm)], by = "mrn_deid", all.x = TRUE)
+
+# handle different possible column names for PHQ-2
+phq2_col_names <- c("phq_value_CMS_PHQ.2_POS.NEG", "phq_value_CMS PHQ-2 POS/NEG", "phq_value_CMS.PHQ.2.POS.NEG")
+phq2_col <- NULL
+for (col in phq2_col_names) {
+  if (col %in% names(outcome_data)) {
+    phq2_col <- col
+    break
+  }
+}
+
+# replace the fcase with basic assignment
+outcome_data[, phq2_positive := FALSE]  # Start with all FALSE
+
+if (!is.null(phq2_col)) {
+  outcome_data[get(phq2_col) == "Positive", phq2_positive := TRUE]
+}
+
+if ("phq2_manual_posneg" %in% names(outcome_data)) {
+  outcome_data[phq2_manual_posneg == "Positive", phq2_positive := TRUE]
+}
+
+patient_phq_status <- outcome_data[, .(
+  ever_phq2_positive = any(phq2_positive, na.rm = TRUE)
+), by = .(mrn_deid, is_chronic_derm)]
+
+# compare PHQ-2 positivity
+# logicals to factors to ensure table has correct dimensions and labels
+patient_phq_status$ever_phq2_positive_factor <- factor(patient_phq_status$ever_phq2_positive, 
+                                                       levels = c(TRUE, FALSE), 
+                                                       labels = c("Positive", "Negative"))
+patient_phq_status$is_chronic_derm_factor <- factor(patient_phq_status$is_chronic_derm, 
+                                                    levels = c(TRUE, FALSE), 
+                                                    labels = c("Chronic Derm", "Control"))
+
+phq2_contingency_table <- table(
+  Chronic_Derm_Status = patient_phq_status$is_chronic_derm_factor,
+  PHQ2_Positive = patient_phq_status$ever_phq2_positive_factor
+)
+
+print(create_comparison_table(phq2_contingency_table, "PHQ-2 Positivity in Matched Cohort", "Chronic Derm vs. Control"))
+
+#PHQ-9 analysis, matched
+
+# add PHQ-9 positivity column 
+outcome_data[, phq9_positive := FALSE]  # Start with all FALSE
+
+# check for PHQ-9 POS/NEG column
+phq9_col_names <- c("phq_value_CMS_PHQ.9_POS.NEG", "phq_value_CMS PHQ-9 POS/NEG", "phq_value_CMS.PHQ.9.POS.NEG")
+phq9_col <- NULL
+for (col in phq9_col_names) {
+  if (col %in% names(outcome_data)) {
+    phq9_col <- col
+    break
+  }
+}
+
+if (!is.null(phq9_col)) {
+  outcome_data[get(phq9_col) == "Positive", phq9_positive := TRUE]
+}
+
+if ("phq9_manual_sum" %in% names(outcome_data)) {
+  outcome_data[!is.na(phq9_manual_sum) & phq9_manual_sum >= 10, phq9_positive := TRUE]
+}
+
+# PHQ-9 analysis
+patient_phq9_status <- outcome_data[, .(
+  ever_phq9_positive = any(phq9_positive, na.rm = TRUE)
+), by = .(mrn_deid, is_chronic_derm)]
+
+# logicals to factors for the comparison function
+patient_phq9_status$ever_phq9_positive_factor <- factor(patient_phq9_status$ever_phq9_positive, levels = c(TRUE, FALSE), labels = c("Positive", "Negative"))
+patient_phq9_status$is_chronic_derm_factor <- factor(patient_phq9_status$is_chronic_derm, levels = c(TRUE, FALSE), labels = c("Chronic Derm", "Control"))
+
+phq9_contingency_table <- table(
+  Chronic_Derm_Status = patient_phq9_status$is_chronic_derm_factor,
+  PHQ9_Positive = patient_phq9_status$ever_phq9_positive_factor
+)
+
+cat("PHQ-9 Results for Matched Cohort:\n")
+print(create_comparison_table(phq9_contingency_table, "PHQ-9 Positivity in Matched Cohort", "Chronic Derm vs. Control"))
+```
+
+
