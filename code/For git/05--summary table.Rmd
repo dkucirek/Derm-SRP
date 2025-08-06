@@ -1,0 +1,303 @@
+---
+title: "05: Summary Table"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Set a local directory for cache and temporary files to avoid pathing issues
+knitr::opts_knit$set(base.dir = normalizePath('.'))
+knitr::opts_chunk$set(cache.path = "rmd_cache/")
+```
+
+
+### Table 1: Propensity Score Matching Balance
+
+```{r}
+# helper function for summary stats and P-values
+summarize_covariate <- function(data, covariate_name, is_continuous = FALSE) {
+  summary_list <- list()
+  
+  total_n_control <- nrow(data[is_chronic_derm == FALSE])
+  total_n_treated <- nrow(data[is_chronic_derm == TRUE])
+
+  if (is_continuous) {
+    mean_sd_control <- data[is_chronic_derm == FALSE, 
+                            paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                   round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+    mean_sd_treated <- data[is_chronic_derm == TRUE, 
+                            paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                   round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+    
+    summary_list[[covariate_name]] <- data.frame(
+      Characteristic = covariate_name,
+      Level = "",
+      Control = mean_sd_control,
+      Treated = mean_sd_treated,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    counts_control <- data[is_chronic_derm == FALSE, .N, by = get(covariate_name)]
+    setnames(counts_control, c("Level", "N"))
+    counts_control[, Percentage := scales::percent(N / total_n_control, accuracy = 1)]
+    counts_control[, Display := paste0(N, " (", Percentage, ")")]
+    
+    counts_treated <- data[is_chronic_derm == TRUE, .N, by = get(covariate_name)]
+    setnames(counts_treated, c("Level", "N"))
+    counts_treated[, Percentage := scales::percent(N / total_n_treated, accuracy = 1)]
+    counts_treated[, Display := paste0(N, " (", Percentage, ")")]
+    
+    # Sort by chronic derm cohort (treated) sizes only in descending order
+    level_totals <- counts_treated[order(-N)]
+    
+    all_levels <- level_totals$Level
+    
+    merged_counts <- full_join(counts_control %>% select(Level, Control = Display), 
+                               counts_treated %>% select(Level, Treated = Display), 
+                               by = "Level")
+    
+    # order merged_counts by the level_totals order
+    merged_counts <- merged_counts[match(all_levels, merged_counts$Level), ]
+    merged_counts[is.na(merged_counts)] <- "0 (0.0%)"
+
+    # TRUE/FALSE to Yes/No for has_psych_condition
+    if (covariate_name == "has_psych_condition") {
+      merged_counts$Level <- recode(merged_counts$Level, `TRUE` = "Yes", `FALSE` = "No")
+    }
+
+    summary_list[[covariate_name]] <- data.frame(
+      Characteristic = covariate_name,
+      Level = merged_counts$Level,
+      Control = merged_counts$Control,
+      Treated = merged_counts$Treated,
+      stringsAsFactors = FALSE
+    )
+  }
+  return(bind_rows(summary_list))
+}
+
+# make summaries for before vs after matching
+covariates_continuous <- c("age_at_encounter")
+covariates_categorical <- c("sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
+
+summary_before_list <- list()
+for (cov in covariates_continuous) {
+  summary_before_list[[cov]] <- summarize_covariate(patient_data_before, cov, is_continuous = TRUE)
+}
+for (cov in covariates_categorical) {
+  summary_before_list[[cov]] <- summarize_covariate(patient_data_before, cov, is_continuous = FALSE)
+}
+summary_before_df <- bind_rows(summary_before_list)
+
+summary_after_list <- list()
+for (cov in covariates_continuous) {
+  summary_after_list[[cov]] <- summarize_covariate(matched_data, cov, is_continuous = TRUE)
+}
+for (cov in covariates_categorical) {
+  summary_after_list[[cov]] <- summarize_covariate(matched_data, cov, is_continuous = FALSE)
+}
+summary_after_df <- bind_rows(summary_after_list)
+
+# combine and format for gt table
+setnames(summary_before_df, c("Control", "Treated"), c("Control_Before", "Treated_Before"))
+setnames(summary_after_df, c("Control", "Treated"), c("Control_After", "Treated_After"))
+
+final_table_data <- full_join(summary_before_df, summary_after_df, by = c("Characteristic", "Level"))
+
+characteristic_order <- c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
+final_table_data$Characteristic <- factor(final_table_data$Characteristic, levels = characteristic_order)
+
+# Create a custom sorting function that preserves descending size order within each characteristic
+final_table_data <- final_table_data %>% 
+  arrange(Characteristic) %>%
+  group_by(Characteristic) %>%
+  mutate(row_order = row_number()) %>%
+  ungroup() %>%
+  arrange(Characteristic, row_order) %>%
+  select(-row_order)
+
+final_table_data$Characteristic <- recode(final_table_data$Characteristic,
+  age_at_encounter = "Age, mean (SD)",
+  sex = "Sex",
+  race_refined = "Race",
+  ethnic_refined = "Ethnicity",
+  fin_class = "Insurance Class",
+  has_psych_condition = "Prior Psych Care"
+)
+
+final_table_data <- final_table_data %>% 
+  mutate(Characteristic = as.character(Characteristic)) %>% 
+  group_by(Characteristic) %>% 
+  mutate(Characteristic_Display = ifelse(row_number() == 1, Characteristic, "")) %>% 
+  ungroup()
+
+library(MatchIt)
+
+# load the same matching data as file 4
+patient_data_df <- as.data.frame(patient_data_before)
+if (is.logical(patient_data_df$is_chronic_derm)) {
+  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+} else {
+  patient_data_df$is_chronic_derm_numeric <- patient_data_df$is_chronic_derm
+}
+
+m_out <- matchit(
+  is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class + has_psych_condition,
+  data = patient_data_df,
+  method = "nearest",
+  distance = "glm",
+  caliper = 0.2,
+  replace = FALSE,
+  ratio = 20
+)
+
+balance_summary <- summary(m_out)
+
+# extract SMDs
+smd_before <- as.data.frame(balance_summary$sum.all) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, SMD_Before = `Std. Mean Diff.`)
+
+smd_after <- as.data.frame(balance_summary$sum.matched) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, SMD_After = `Std. Mean Diff.`)
+
+smd_table <- inner_join(smd_before, smd_after, by = "Covariate")
+smd_table$SMD_Before <- round(abs(smd_table$SMD_Before), 3)
+smd_table$SMD_After <- round(abs(smd_table$SMD_After), 3)
+
+# make mapping function to match MatchIt covariate names to table 
+map_covariate_to_table <- function(covariate_name) {
+  if (covariate_name == "age_at_encounter") {
+    return(list(char = "Age, mean (SD)", level = ""))
+  } else if (grepl("^sex", covariate_name)) {
+    level <- gsub("^sex", "", covariate_name)
+    return(list(char = "Sex", level = level))
+  } else if (grepl("^race_refined", covariate_name)) {
+    level <- gsub("^race_refined", "", covariate_name)
+    return(list(char = "Race", level = level))
+  } else if (grepl("^ethnic_refined", covariate_name)) {
+    level <- gsub("^ethnic_refined", "", covariate_name)
+    return(list(char = "Ethnicity", level = level))
+  } else if (grepl("^fin_class", covariate_name)) {
+    level <- gsub("^fin_class", "", covariate_name)
+    return(list(char = "Insurance Class", level = level))
+  } else if (grepl("^has_psych_condition", covariate_name)) {
+    level <- gsub("^has_psych_condition", "", covariate_name)
+    level <- ifelse(level == "TRUE", "Yes", ifelse(level == "FALSE", "No", level))
+    return(list(char = "Prior Psych Care", level = level))
+  }
+  return(NULL)
+}
+
+# add SMD columns to final table data
+final_table_data$SMD_Before <- ""
+final_table_data$SMD_After <- ""
+
+# map SMDs to all rows based on characteristic and level
+for (i in 1:nrow(final_table_data)) {
+  char <- final_table_data$Characteristic[i]
+  level <- final_table_data$Level[i]
+  
+  # find matching SMD entries
+  for (j in 1:nrow(smd_table)) {
+    mapping <- map_covariate_to_table(smd_table$Covariate[j])
+    if (!is.null(mapping) && mapping$char == char && mapping$level == level) {
+      final_table_data$SMD_Before[i] <- as.character(smd_table$SMD_Before[j])
+      final_table_data$SMD_After[i] <- as.character(smd_table$SMD_After[j])
+      break
+    }
+  }
+}
+
+#  gt table with SMDs
+table1_gt <- final_table_data %>% 
+  select(Characteristic_Display, Level, Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After) %>% 
+  gt() %>% 
+  cols_label(
+    Characteristic_Display = "Characteristic",
+    Level = "",
+    Control_Before = "Control",
+    Treated_Before = "Chronic Derm",
+    SMD_Before = "SMD",
+    Control_After = "Control", 
+    Treated_After = "Chronic Derm",
+    SMD_After = "SMD"
+  ) %>% 
+  tab_spanner(label = "Before Matching", columns = c(Control_Before, Treated_Before, SMD_Before)) %>% 
+  tab_spanner(label = "After Matching", columns = c(Control_After, Treated_After, SMD_After)) %>% 
+  tab_header(
+    title = "Table 1. Chronic Dermatology and Control Demographics Before and After Propensity Score Matching",
+    subtitle = "Values are n (%) unless otherwise specified. SMD = Standardized Mean Difference."
+  ) %>% 
+  #  styling for readability
+  tab_style(
+    style = cell_text(indent = px(20), size = px(13)),
+    locations = cells_body(columns = Level, rows = Level != "")
+  ) %>% 
+  tab_style(
+    style = cell_text(weight = "bold", size = px(14)),
+    locations = cells_body(columns = Characteristic_Display, rows = Characteristic_Display != "")
+  ) %>%
+  #  alternate row shading 
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(final_table_data), 2))
+  ) %>%
+  # title and subtitle styling
+  tab_style(
+    style = list(
+      cell_text(size = px(16), weight = "bold", color = "#212529")
+    ),
+    locations = cells_title("title")
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(size = px(13), style = "italic", color = "#6c757d")
+    ),
+    locations = cells_title("subtitle")
+  ) %>%
+  cols_align(align = "left", columns = c(Characteristic_Display, Level)) %>% 
+  cols_align(align = "center", columns = c(Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After)) %>% 
+  # enhanced table options
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    table.border.left.color = "#dee2e6",
+    table.border.left.width = px(1),
+    table.border.right.color = "#dee2e6",
+    table.border.right.width = px(1),
+    column_labels.font.weight = "bold",
+    column_labels.font.size = px(13),
+    table.font.size = px(13),
+    table.font.names = c("Calibri", "Segoe UI", "Helvetica", "Arial", "sans-serif"),
+    data_row.padding = px(8),
+    table.margin.left = px(0),
+    table.margin.right = px(0),
+    table.width = pct(100)
+  ) %>%
+  # enhanced footnote styling
+  tab_footnote(
+    footnote = "SMD <0.1 indicates good balance; SMD >0.1 indicates potential imbalance. SMD calculated as |mean_treated - mean_control| / pooled_SD for continuous variables, maximum category-specific SMD for categorical variables.",
+    locations = cells_column_labels(columns = SMD_Before)
+  ) %>%
+  tab_style(
+    style = cell_text(size = px(11), color = "#6c757d"),
+    locations = cells_footnotes()
+  ) %>%
+  # enhanced source note styling
+  tab_source_note(
+    source_note = "Propensity score matching performed using logistic regression with covariates: age, sex, race, ethnicity, insurance class, and prior psychiatric care."
+  ) %>%
+  tab_style(
+    style = cell_text(size = px(11), color = "#6c757d", style = "italic"),
+    locations = cells_source_notes()
+  )
+
+print(table1_gt)
+```
+
+
+
