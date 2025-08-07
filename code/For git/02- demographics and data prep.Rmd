@@ -51,12 +51,11 @@ result_info[, fin_class := fcase(
 )]
 
 result_info[, ethnic_refined := fcase(
-  ethnic == "Mexican, Mexican American, or Chicano/a", "Mexican / Chicano",
-  ethnic %in% c("Hispanic or Latino", "Puerto Rican", "Cuban", "Other Hispanic, Latino/a, or Spanish origin"), "Other Hispanic / Latino",
+  ethnic %in% c("Mexican, Mexican American, or Chicano/a", "Hispanic or Latino", "Puerto Rican", "Cuban", "Other Hispanic, Latino/a, or Spanish origin"), "Hispanic / Latino",
   ethnic == "Not Hispanic, Latino/a, or Spanish origin", "Not Hispanic / Latino",
-  ethnic == "Patient declines to respond", "Patient Declined",
-  ethnic == "Unknown or Patient unable to respond", "Unknown / Other",
-  default = "Unknown / Other"
+  ethnic == "Patient declines to respond", "NA",
+  ethnic == "Unknown or Patient unable to respond", "Other",
+  default = "Other"
 )]
 
 result_info[, race_refined := fcase(
@@ -64,10 +63,8 @@ result_info[, race_refined := fcase(
   race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese"), "East/Other Asian",
   race == "White", "White",
   race == "Black or African-American", "Black or African American",
-  race %in% c("Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan"), "Native Hawaiian / Pacific Islander",
-  race == "American Indian or Alaska Native", "American Indian / Alaska Native",
   race == "More than one Race", "More than one Race",
-  race %in% c("None of the above", "Other"), "Other",
+  race %in% c("Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan", "American Indian or Alaska Native", "None of the above", "Other"), "Other",
   race %in% c("Patient declines to respond", "Unknown or Patient unable to respond"), "Declined / Unknown",
   default = "Other"
 )]
@@ -111,14 +108,14 @@ all_psych_encounters <- result_wide[str_detect(toupper(appt_dept), psych_regex)]
 # get first psych visit date per patient
 first_psych_dates <- all_psych_encounters[, .(first_psych_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
 
-# get first derm clinic visit date per patient
-first_derm_dates <- derm_clinic_cohort[, .(first_derm_clinic_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
+# get first chronic derm visit date per patient
+first_derm_dates <- chronic_derm_cohort[, .(first_chronic_derm_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
 
 # merge psych and derm first visit dates
 patient_first_visits <- merge(first_psych_dates, first_derm_dates, by = "mrn_deid", all.x = TRUE, all.y = TRUE)
 
-# define has_psych_condition based on timing--needs behavioral care visit before derm
-patient_first_visits[, has_psych_condition_timed := !is.na(first_psych_visit) & !is.na(first_derm_clinic_visit) & (first_psych_visit < first_derm_clinic_visit)]
+# define has_psych_condition based on timing--needs behavioral care visit before chronic derm diagnosis
+patient_first_visits[, has_psych_condition_timed := !is.na(first_psych_visit) & !is.na(first_chronic_derm_visit) & (first_psych_visit < first_chronic_derm_visit)]
 patient_first_visits[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
 
 # merge num_visits and has_psych_condition_timed into patient_data_for_matching
