@@ -60,12 +60,11 @@ result_info[, ethnic_refined := fcase(
 
 result_info[, race_refined := fcase(
   race %in% c("Asian Indian", "Asian/Mideast Indian"), "South Asian",
-  race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese"), "East/Other Asian",
+  race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese", "Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan", "American Indian or Alaska Native", "None of the above", "Other"), "Other",
   race == "White", "White",
   race == "Black or African-American", "Black or African American",
   race == "More than one Race", "More than one Race",
-  race %in% c("Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan", "American Indian or Alaska Native", "None of the above", "Other"), "Other",
-  race %in% c("Patient declines to respond", "Unknown or Patient unable to respond"), "Declined / Unknown",
+  race %in% c("Patient declines to respond", "Unknown or Patient unable to respond"), "Declined/NA",
   default = "Other"
 )]
 
@@ -114,8 +113,16 @@ first_derm_dates <- chronic_derm_cohort[, .(first_chronic_derm_visit = min(enc_d
 # merge psych and derm first visit dates
 patient_first_visits <- merge(first_psych_dates, first_derm_dates, by = "mrn_deid", all.x = TRUE, all.y = TRUE)
 
-# define has_psych_condition based on timing--needs behavioral care visit before chronic derm diagnosis
-patient_first_visits[, has_psych_condition_timed := !is.na(first_psych_visit) & !is.na(first_chronic_derm_visit) & (first_psych_visit < first_chronic_derm_visit)]
+# define has_psych_condition based on timing
+# For chronic derm patients: needs behavioral care visit before chronic derm diagnosis
+# For control patients: any psychiatric visit counts (no chronic derm timing constraint)
+patient_first_visits[, has_psych_condition_timed := ifelse(
+  !is.na(first_chronic_derm_visit), 
+  # Chronic derm patients: psych visit must be before derm visit
+  !is.na(first_psych_visit) & (first_psych_visit < first_chronic_derm_visit),
+  # Control patients: any psych visit counts
+  !is.na(first_psych_visit)
+)]
 patient_first_visits[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
 
 # merge num_visits and has_psych_condition_timed into patient_data_for_matching
