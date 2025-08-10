@@ -44,6 +44,9 @@ result_info <- unique(result_wide[, .(mrn_deid, age_at_encounter, fin_class, rac
 result_info[, fin_class := str_to_title(fin_class)]
 result_info[fin_class == "Comercial", fin_class := "Commercial"]
 
+# combine Blue Cross/Blue Shield with Private Payors
+result_info[fin_class %in% c("Blue Cross/Blue Shield", "Private Payors"), fin_class := "Private Payors"]
+
 # put small insurance classes into 'other'
 result_info[, fin_class := fcase(
   fin_class %in% c("Ppo", "Hmo/Pos", "Miscellaneous", "Commercial", "", "Grants & Funds"), "Other",
