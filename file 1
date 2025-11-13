@@ -1,0 +1,535 @@
+---
+title: "01: Joining and Cohort Definition"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(data.table)
+
+data_path <- "Z:/Kucirek/"
+
+demo_cols <- c("MRN_DEID", "race", "ethnic", "sex")
+demo_data <- fread(file.path(data_path, "Data(Do not touch!)/dr_592588_demo.csv"), select = demo_cols)
+setnames(demo_data, tolower(names(demo_data)))
+
+# Depression
+depression_cols <- c("MRN_DEID", "PHQ_DTTM", "PHQ_FIELD", "PHQ_VALUE")
+depression_data <- fread(file.path(data_path, "Data(Do not touch!)/DR_592588_DEPRESSION.txt"), select = depression_cols)
+setnames(depression_data, tolower(names(depression_data)))
+
+encounter_cols <- c("MRN_DEID", "age_at_encounter", "FIN_CLASS", "APPT_DEPT", "ICD10_DX", "ICD_DIAGNOSIS", "ENC_DATE")
+
+#age >= 18 
+encounters_data <- fread(
+  file.path(data_path, "Data(Do not touch!)/dr_592588_encounter.txt"),
+  select = encounter_cols
+)[age_at_encounter >= 18]
+
+setnames(encounters_data, tolower(names(encounters_data)))
+```
+
+### Data Cleaning and Merging
+
+```{r}
+#convert to data.table, clean MRNs
+datasets <- list(demo_data, depression_data, encounters_data)
+lapply(datasets, setDT)
+lapply(datasets, function(dt) dt[, mrn_deid := as.character(trimws(mrn_deid))])
+
+# Keep unique MRNs in demo_data
+demo_data <- unique(demo_data, by = "mrn_deid")
+
+# Merge demo and depression data on MRN
+dd_merged <- merge(demo_data, depression_data, by = "mrn_deid", all = FALSE)
+setDT(dd_merged)
+```
+
+### Time-based Filtering
+
+```{r}
+# screening dates to date type, rename
+dd_merged[, phq_date := as.Date(phq_dttm)]
+encounters_data[, enc_date := as.Date(enc_date)]
+
+# PHQ values to numeric 
+dd_merged[, phq_value_num := fifelse(
+  tolower(phq_value) %in% c("positive", "negative", ""),
+  NA_real_,
+  as.numeric(phq_value)
+)]
+
+# ±1 month window around screening dates
+dd_merged[, `:=`(window_start = phq_date %m-% months(1), window_end = phq_date %m+% months(1))]
+encounters_data[, `:=`(enc_start = enc_date, enc_end = enc_date)]
+
+# set keys for data.table overlaps
+setkey(dd_merged, mrn_deid, window_start, window_end)
+setkey(encounters_data, mrn_deid, enc_start, enc_end)
+
+# join encounters with screenings within ±1 month
+result_all_matches <- foverlaps(encounters_data, dd_merged,
+  by.x = c("mrn_deid", "enc_start", "enc_end"),
+  by.y = c("mrn_deid", "window_start", "window_end"),
+  type = "any", nomatch = 0L
+)
+
+# absolute date difference between encounter and screening
+result_all_matches[, date_diff := abs(as.numeric(enc_date - phq_date))]
+
+# keep closest screening for each (mrn, encounter, phq_field)
+result_closest_all <- result_all_matches[
+  order(mrn_deid, enc_date, phq_field, date_diff)
+][
+  , .SD[1], by = .(mrn_deid, enc_date, phq_field)
+]
+
+# str_to_title to fin_class before pivoting
+result_closest_all[, fin_class := str_to_title(fin_class)]
+result_closest_all[, phq_field := str_replace_all(phq_field, " ", "_")]
+result_closest_all[, phq_field := make.names(phq_field)]
+
+# pivot to wide: one row per (mrn, encounter)
+# data.table's dcast() is faster than pivot_wider() for large data
+
+cat("Number of rows to process:", nrow(result_closest_all), "\n")
+
+phq_value_wide <- dcast(result_closest_all, 
+                        mrn_deid + enc_date + age_at_encounter + fin_class + appt_dept + icd10_dx + icd_diagnosis + race + ethnic + sex ~ phq_field, 
+                        value.var = "phq_value", 
+                        fill = NA_character_,
+                        fun.aggregate = function(x) x[1])  # take first value if duplicates
+
+phq_value_num_wide <- dcast(result_closest_all[!is.na(phq_value_num)], 
+                            mrn_deid + enc_date ~ phq_field, 
+                            value.var = "phq_value_num", 
+                            fill = NA_real_,
+                            fun.aggregate = function(x) x[1])
+
+phq_date_wide <- dcast(result_closest_all[!is.na(phq_date)], 
+                       mrn_deid + enc_date ~ phq_field, 
+                       value.var = "phq_date", 
+                       fill = as.Date(NA),
+                       fun.aggregate = function(x) x[1])
+
+# rename columns
+if (ncol(phq_value_num_wide) > 2) {
+  setnames(phq_value_num_wide, 3:ncol(phq_value_num_wide), 
+           paste0("phq_value_num_", names(phq_value_num_wide)[3:ncol(phq_value_num_wide)]))
+}
+
+if (ncol(phq_date_wide) > 2) {
+  setnames(phq_date_wide, 3:ncol(phq_date_wide), 
+           paste0("phq_date_", names(phq_date_wide)[3:ncol(phq_date_wide)]))
+}
+
+if (ncol(phq_value_wide) > 10) {
+  setnames(phq_value_wide, 11:ncol(phq_value_wide), 
+           paste0("phq_value_", names(phq_value_wide)[11:ncol(phq_value_wide)]))
+}
+
+# merge the three wide datasets using data.table joins
+cat("Merging datasets...\n")
+result_wide <- phq_value_wide
+
+if (nrow(phq_value_num_wide) > 0) {
+  result_wide <- merge(result_wide, phq_value_num_wide, 
+                       by = c("mrn_deid", "enc_date"), 
+                       all.x = TRUE)
+}
+
+if (nrow(phq_date_wide) > 0) {
+  result_wide <- merge(result_wide, phq_date_wide, 
+                       by = c("mrn_deid", "enc_date"), 
+                       all.x = TRUE)
+}
+
+# back to data.table if needed
+setDT(result_wide)
+
+cat("Data reshaping complete. Final dimensions:", nrow(result_wide), "x", ncol(result_wide), "\n")
+
+# standardize column names
+cat("Standardizing column names...\n")
+
+# batch renaming
+column_mappings <- list(
+  "phq_value_CMS.PHQ.2.POS.NEG" = "phq_value_CMS_PHQ-2_POS/NEG",
+  "phq_value_CMS.PHQ.9.POS.NEG" = "phq_value_CMS_PHQ-9_POS/NEG", 
+  "phq_value_num_PHQ.9.Total.Score" = "phq_value_num_PHQ-9_Total_Score",
+  "phq_value_CMS PHQ-2 POS/NEG" = "phq_value_CMS_PHQ-2_POS/NEG",
+  "phq_value_CMS PHQ-9 POS/NEG" = "phq_value_CMS_PHQ-9_POS/NEG",
+  "phq_value_num_PHQ-9 Total Score" = "phq_value_num_PHQ-9_Total_Score"
+)
+
+# apply all mappings
+for (old_name in names(column_mappings)) {
+  if (old_name %in% names(result_wide)) {
+    setnames(result_wide, old_name, column_mappings[[old_name]])
+  }
+}
+
+cat("Column standardization complete.\n")
+
+# --- manual PHQ-9 score calculation ---
+phq9_items <- c(
+  "phq_value_num_feeling tired or having little energy score",
+  "phq_value_num_poor appetite or overeating score",
+  "phq_value_num_little interest or pleasure in doing things score",
+  "phq_value_num_feeling down, depressed, or hopeless score",
+  "phq_value_num_moving or speaking so slowly that other people have noticed. Or the opposite score",
+  "phq_value_num_feeling bad about yourself or that you are a failure or have let yourself or your family down score",
+  "phq_value_num_thoughts that you would be better off dead or of hurting yourself score",
+  "phq_value_num_trouble falling or staying asleep, or sleep too much score",
+  "phq_value_num_trouble concentrating on things, such as reading the newspaper or watching television score"
+)
+
+# PHQ2 items (subset of PHQ9)
+phq2_items <- c(
+  "phq_value_num_little interest or pleasure in doing things score",
+  "phq_value_num_feeling down, depressed, or hopeless score"
+)
+
+# Convert to data.table first
+setDT(result_wide)
+
+# --- HIERARCHICAL PHQ SEVERITY SCORING ---
+# Find correct PHQ column names after standardization
+phq_columns <- names(result_wide)[grepl("phq", names(result_wide), ignore.case = TRUE)]
+
+# Find PHQ9 total column 
+phq9_col_candidates <- phq_columns[grepl("PHQ.*9.*Total", phq_columns, ignore.case = TRUE)]
+phq9_col_name <- if(length(phq9_col_candidates) > 0) phq9_col_candidates[1] else NA
+
+# Find PHQ2 score column
+phq2_col_candidates <- phq_columns[grepl("PHQ.*2.*score", phq_columns, ignore.case = TRUE)]
+phq2_col_name <- if(length(phq2_col_candidates) > 0) phq2_col_candidates[1] else NA
+
+cat("PHQ column detection:\n")
+cat("- PHQ9 column:", ifelse(is.na(phq9_col_name), "NOT FOUND", phq9_col_name), "\n")
+cat("- PHQ2 column:", ifelse(is.na(phq2_col_name), "NOT FOUND", phq2_col_name), "\n")
+
+# Create hierarchical PHQ scoring
+if (!is.na(phq9_col_name)) {
+  result_wide[, (phq9_col_name) := as.numeric(get(phq9_col_name))]
+}
+if (!is.na(phq2_col_name)) {
+  result_wide[, (phq2_col_name) := as.numeric(get(phq2_col_name))]
+}
+
+# Create hierarchical score (PHQ9 preferred, PHQ2 fallback)
+result_wide[, phq_score := {
+  if (!is.na(phq9_col_name) && !is.na(phq2_col_name)) {
+    fifelse(!is.na(get(phq9_col_name)), get(phq9_col_name),
+            fifelse(!is.na(get(phq2_col_name)), get(phq2_col_name), NA_real_))
+  } else if (!is.na(phq9_col_name)) {
+    get(phq9_col_name)
+  } else if (!is.na(phq2_col_name)) {
+    get(phq2_col_name)
+  } else {
+    NA_real_
+  }
+}]
+
+# Track which PHQ type was used
+result_wide[, phq_type_used := {
+  if (!is.na(phq9_col_name) && !is.na(phq2_col_name)) {
+    fifelse(!is.na(get(phq9_col_name)), "PHQ9",
+            fifelse(!is.na(get(phq2_col_name)), "PHQ2", "Missing"))
+  } else if (!is.na(phq9_col_name)) {
+    fifelse(!is.na(get(phq9_col_name)), "PHQ9", "Missing")
+  } else if (!is.na(phq2_col_name)) {
+    fifelse(!is.na(get(phq2_col_name)), "PHQ2", "Missing") 
+  } else {
+    "Missing"
+  }
+}]
+
+# Create 5-category severity classification
+result_wide[, phq_severity := fifelse(is.na(phq_score), "Missing",
+                              fifelse(phq_score <= 4, "Negative",
+                              fifelse(phq_score <= 9, "Mild",
+                              fifelse(phq_score <= 14, "Moderate",
+                              fifelse(phq_score <= 19, "Moderately Severe", "Severe")))))]
+
+# Create clinical and subclinical depression classifications for research
+result_wide[, phq_clinical := phq_score >= 10 & !is.na(phq_score)]      # Clinical depression (10+)
+result_wide[, phq_subclinical := phq_score >= 5 & phq_score <= 9 & !is.na(phq_score)]  # Subclinical (5-9)
+
+# Create validation function for PHQ data
+validate_clinical_phq_data <- function(data) {
+  # Ensure required PHQ columns exist
+  if (!"phq_clinical" %in% names(data) || !"phq_subclinical" %in% names(data)) {
+    warning("PHQ clinical/subclinical columns not found. Creating from phq_score if available.")
+    if ("phq_score" %in% names(data)) {
+      data[, phq_clinical := phq_score >= 10 & !is.na(phq_score)]
+      data[, phq_subclinical := phq_score >= 5 & phq_score <= 9 & !is.na(phq_score)]
+    } else {
+      data[, phq_clinical := FALSE]
+      data[, phq_subclinical := FALSE]
+    }
+  }
+  return(data)
+}
+
+# Debug: Verify columns were created
+cat("\n=== CLINICAL/SUBCLINICAL COLUMNS VERIFICATION ===\n")
+cat("phq_clinical column exists:", "phq_clinical" %in% names(result_wide), "\n")
+cat("phq_subclinical column exists:", "phq_subclinical" %in% names(result_wide), "\n")
+if ("phq_clinical" %in% names(result_wide)) {
+  cat("Clinical depression cases:", sum(result_wide$phq_clinical, na.rm = TRUE), "\n")
+}
+if ("phq_subclinical" %in% names(result_wide)) {
+  cat("Subclinical depression cases:", sum(result_wide$phq_subclinical, na.rm = TRUE), "\n")
+}
+
+
+# --- Print PHQ scoring summary ---
+cat("\n=== PHQ HIERARCHICAL SCORING SUMMARY ===\n")
+cat("Total encounters:", nrow(result_wide), "\n")
+
+# COMPREHENSIVE PHQ DATA UTILIZATION REPORT  
+cat("=== PHQ DATA UTILIZATION ANALYSIS ===\n")
+
+# Count encounters with PHQ data
+cat("PHQ DATA SUMMARY:\n")
+if (!is.na(phq9_col_name)) {
+  cat("- Encounters with PHQ9 scores:", sum(!is.na(result_wide[[phq9_col_name]])), "\n")
+}
+if (!is.na(phq2_col_name)) {
+  cat("- Encounters with PHQ2 scores:", sum(!is.na(result_wide[[phq2_col_name]])), "\n")
+}
+cat("- Total encounters with usable PHQ scores:", sum(!is.na(result_wide$phq_score)), "\n")
+
+# Show final PHQ type usage
+phq_type_counts <- result_wide[, .N, by = phq_type_used]
+cat("\nFINAL PHQ TYPE USAGE:\n")
+print(phq_type_counts)
+
+phq_severity_counts <- result_wide[, .N, by = phq_severity]
+cat("\nPHQ Severity Distribution:\n") 
+print(phq_severity_counts)
+
+# Patient-level summary
+patient_phq_summary <- result_wide[, .(
+  has_any_phq = any(!is.na(phq_score)),
+  has_phq9 = any(phq_type_used == "PHQ9", na.rm = TRUE),
+  has_phq2_only = any(phq_type_used == "PHQ2", na.rm = TRUE) & !any(phq_type_used == "PHQ9", na.rm = TRUE),
+  max_severity = ifelse(any(!is.na(phq_score)), 
+                       phq_severity[which.max(ifelse(is.na(phq_score), -1, phq_score))], 
+                       "Missing")
+), by = mrn_deid]
+
+cat("\nPatient-level PHQ Data Summary:\n")
+cat("Patients with any PHQ data:", sum(patient_phq_summary$has_any_phq), "\n")
+cat("Patients with PHQ9 data:", sum(patient_phq_summary$has_phq9), "\n") 
+cat("Patients with PHQ2 only:", sum(patient_phq_summary$has_phq2_only), "\n")
+cat("Patients with no PHQ data:", sum(!patient_phq_summary$has_any_phq), "\n") 
+```
+
+### Define and Save Cohorts
+
+```{r}
+# Define ICD-10 codes for chronic dermatological conditions
+# Complete list with descriptions available in Supplemental Table S1 at end of File 7
+chronic_condition_icd_codes <- list(
+  "Scarring Alopecia" = "L66",
+  "Acne" = "L70",
+  "Atopic Dermatitis" = "L20",
+  "Hidradenitis Suppurativa" = "L73.2",
+  "Rosacea" = "L71",
+  "Vitiligo" = "L80",
+  "Alopecia Areata" = "L63",
+  "Psoriasis" = "L40",
+  "Lupus Erythematosus" = c("L93", "M32.1", "M32.9")
+)
+
+# make one regex pattern from all codes for efficient filtering (text string used to define search pattern)
+all_chronic_codes <- unlist(chronic_condition_icd_codes)
+chronic_pattern <- paste(all_chronic_codes, collapse = "|")
+
+# ===== COMPREHENSIVE CONDITION ASSIGNMENT - SINGLE SOURCE OF TRUTH =====
+cat("\n=== CREATING MASTER CONDITION ASSIGNMENTS ===\n")
+
+# Create comprehensive patient-condition matrix 
+chronic_derm_patient_conditions <- list()
+condition_patient_counts <- list()
+
+for (condition_name in names(chronic_condition_icd_codes)) {
+  icd_codes <- chronic_condition_icd_codes[[condition_name]]
+  condition_pattern <- paste(icd_codes, collapse = "|")
+  
+  # Find ALL patients with this condition (with PHQ data requirement)
+  patients_with_condition <- unique(result_wide[str_detect(icd10_dx, condition_pattern) & !is.na(phq_score), mrn_deid])
+  
+  chronic_derm_patient_conditions[[condition_name]] <- patients_with_condition
+  condition_patient_counts[[condition_name]] <- length(patients_with_condition)
+  
+  cat(paste0("  ", condition_name, ": ", length(patients_with_condition), " patients\n"))
+}
+
+# Create overall chronic derm cohort (same as before for compatibility)
+chronic_derm_cohort <- result_wide[str_detect(icd10_dx, chronic_pattern) & !is.na(phq_score)]
+
+# Safety check for empty cohort
+if (nrow(chronic_derm_cohort) == 0) {
+  warning("No patients found with both chronic dermatology conditions AND PHQ data!")
+}
+
+# Create MASTER chronic derm dataset with pre-assigned conditions
+cat("\n=== CREATING MASTER CHRONIC DERM DATASET ===\n")
+chronic_derm_master <- result_wide[mrn_deid %in% unique(chronic_derm_cohort$mrn_deid)]
+
+# Add condition assignment columns for consistent use across all files
+condition_column_mapping <- list()
+for (condition_name in names(chronic_condition_icd_codes)) {
+  # Create clean column name
+  condition_col_name <- paste0("condition_", tolower(gsub("[^A-Za-z0-9]", "_", condition_name)))
+  condition_col_name <- gsub("_+", "_", condition_col_name)  # Remove multiple underscores
+  condition_col_name <- gsub("_$", "", condition_col_name)   # Remove trailing underscore
+  
+  # Store mapping for later use
+  condition_column_mapping[[condition_name]] <- condition_col_name
+  
+  # Add column to master dataset
+  chronic_derm_master[, (condition_col_name) := mrn_deid %in% chronic_derm_patient_conditions[[condition_name]]]
+  cat(paste0("  Added column: ", condition_col_name, " for ", condition_name, "\n"))
+}
+
+# Create patient-level condition summary for easy access
+chronic_derm_patient_summary <- chronic_derm_master[, {
+  condition_cols <- grep("^condition_", names(.SD), value = TRUE)
+  condition_list <- lapply(condition_cols, function(col) any(get(col)))
+  names(condition_list) <- condition_cols
+  c(list(
+    total_encounters = .N,
+    has_phq_data = any(!is.na(phq_score)),
+    phq_encounters = sum(!is.na(phq_score)),
+    max_phq_score = if(any(!is.na(phq_score))) max(phq_score, na.rm = TRUE) else NA_real_,
+    ever_clinical = any(phq_clinical, na.rm = TRUE),
+    ever_subclinical = any(phq_subclinical, na.rm = TRUE)
+  ), condition_list)
+}, by = mrn_deid]
+
+cat("Master datasets created:\n")
+cat("  chronic_derm_master: ", nrow(chronic_derm_master), " encounters\n")
+cat("  chronic_derm_patient_summary: ", nrow(chronic_derm_patient_summary), " patients\n")
+
+# --- PATIENT FLOW TRACKING ---
+cat("\n=== PATIENT FLOW SUMMARY ===\n")
+cat("1. Total unique patients in full dataset:", uniqueN(result_wide$mrn_deid), "\n")
+cat("2. Total encounters in full dataset:", nrow(result_wide), "\n")
+cat("3. Chronic derm patients with PHQ data (unique):", uniqueN(chronic_derm_cohort$mrn_deid), "\n") 
+cat("4. Chronic derm encounters with PHQ data:", nrow(chronic_derm_cohort), "\n")
+cat("   NOTE: Chronic derm cohort now ONLY includes patients with available PHQ scores\n")
+
+# PHQ data availability in chronic derm cohort
+chronic_derm_phq_summary <- chronic_derm_cohort[, .(
+  has_any_phq = any(!is.na(phq_score)),
+  has_phq9 = any(phq_type_used == "PHQ9", na.rm = TRUE),
+  has_phq2_only = any(phq_type_used == "PHQ2", na.rm = TRUE) & !any(phq_type_used == "PHQ9", na.rm = TRUE),
+  worst_severity = phq_severity[which.max(ifelse(is.na(phq_score), -1, phq_score))]
+), by = mrn_deid]
+
+cat("\n=== CHRONIC DERM COHORT PHQ DATA ===\n")
+cat("Chronic derm patients with any PHQ data:", sum(chronic_derm_phq_summary$has_any_phq), "(100% by inclusion criteria)\n")
+cat("Chronic derm patients with PHQ9:", sum(chronic_derm_phq_summary$has_phq9), "\n")
+cat("Chronic derm patients with PHQ2 only:", sum(chronic_derm_phq_summary$has_phq2_only), "\n")
+cat("Chronic derm patients with no PHQ data:", sum(!chronic_derm_phq_summary$has_any_phq), "(should be 0 by design)\n")
+
+# VERIFICATION: Check that all chronic derm patients have PHQ data
+patients_no_phq <- chronic_derm_phq_summary[has_any_phq == FALSE]
+cat("\n=== VERIFICATION: CHRONIC DERM COHORT PHQ COMPLIANCE ===\n")
+cat("Total chronic derm patients without PHQ data:", nrow(patients_no_phq), "(should be 0)\n")
+
+if(nrow(patients_no_phq) > 0) {
+  cat("ERROR: Found chronic derm patients without PHQ data - this violates inclusion criteria!\n")
+  print(head(patients_no_phq, 5))
+} else {
+  cat("✓ SUCCESS: All chronic derm patients have PHQ data as required\n")
+}
+
+# PHQ severity distribution in chronic derm cohort
+chronic_derm_severity_counts <- chronic_derm_phq_summary[, .N, by = worst_severity]
+cat("\nChronic Derm Cohort - Worst PHQ Severity per Patient:\n")
+print(chronic_derm_severity_counts)
+
+data_path <- "Z:/Kucirek/"
+
+# ===== VERIFICATION SYSTEM =====
+cat("\n=== MASTER DATASET VERIFICATION ===\n")
+verify_master_counts <- function() {
+  cat("CONDITION COUNT VERIFICATION:\n")
+  for (condition_name in names(chronic_condition_icd_codes)) {
+    condition_col_name <- paste0("condition_", gsub("[^A-Za-z0-9]", "_", tolower(condition_name)))
+    if (condition_col_name %in% names(chronic_derm_patient_summary)) {
+      count <- sum(chronic_derm_patient_summary[[condition_col_name]], na.rm = TRUE)
+      cat(paste0("  ", condition_name, ": ", count, " patients\n"))
+    }
+  }
+  
+  cat("\nPHQ DATA VERIFICATION:\n")
+  cat("  Patients with clinical depression: ", sum(chronic_derm_patient_summary$ever_clinical, na.rm = TRUE), "\n")
+  cat("  Patients with subclinical depression: ", sum(chronic_derm_patient_summary$ever_subclinical, na.rm = TRUE), "\n")
+  cat("  Total chronic derm patients: ", nrow(chronic_derm_patient_summary), "\n")
+}
+verify_master_counts()
+
+#save intermediate files - EXPANDED with master datasets
+saveRDS(result_wide, file.path(data_path, "result_wide.rds"))
+saveRDS(chronic_derm_cohort, file.path(data_path, "chronic_derm_cohort.rds"))
+saveRDS(patient_phq_summary, file.path(data_path, "patient_phq_summary.rds"))
+saveRDS(chronic_derm_phq_summary, file.path(data_path, "chronic_derm_phq_summary.rds"))
+
+# Create patient_data_for_matching - patient-level dataset with demographic info and chronic derm status
+# First check what demographic columns exist
+cat("Available columns in result_wide:\n")
+cat(paste(names(result_wide), collapse = ", "), "\n")
+
+# Create demographic summary with available columns
+available_cols <- names(result_wide)
+patient_data_for_matching <- result_wide[, {
+  demo_list <- list(
+    age_at_encounter = if("age_at_encounter" %in% available_cols) mean(age_at_encounter, na.rm = TRUE) else NA_real_,
+    is_chronic_derm = mrn_deid %in% chronic_derm_patient_summary$mrn_deid
+  )
+  
+  # Add available demographic columns
+  if("sex" %in% available_cols) demo_list$sex <- first(na.omit(sex))
+  if("race_refined" %in% available_cols) demo_list$race_refined <- first(na.omit(race_refined))
+  if("race" %in% available_cols && !"race_refined" %in% available_cols) demo_list$race <- first(na.omit(race))
+  if("fin_class" %in% available_cols) demo_list$fin_class <- first(na.omit(fin_class))
+  if("insurance_type" %in% available_cols && !"fin_class" %in% available_cols) demo_list$insurance_type <- first(na.omit(insurance_type))
+  
+  demo_list
+}, by = mrn_deid]
+
+cat("Created patient_data_for_matching with columns:", paste(names(patient_data_for_matching), collapse = ", "), "\n")
+
+# NEW: Save master datasets for consistent use across all files
+saveRDS(chronic_derm_master, file.path(data_path, "chronic_derm_master.rds"))
+saveRDS(chronic_derm_patient_summary, file.path(data_path, "chronic_derm_patient_summary.rds"))
+saveRDS(chronic_derm_patient_conditions, file.path(data_path, "chronic_derm_patient_conditions.rds"))
+saveRDS(condition_patient_counts, file.path(data_path, "condition_patient_counts.rds"))
+saveRDS(condition_column_mapping, file.path(data_path, "condition_column_mapping.rds"))
+saveRDS(patient_data_for_matching, file.path(data_path, "patient_data_for_matching.rds"))
+
+cat(paste("\nAll data files saved to:", data_path, "\n"))
+cat("NEW MASTER FILES for consistent downstream use:\n")
+cat("  chronic_derm_master.rds - all encounters with pre-assigned conditions\n")
+cat("  chronic_derm_patient_summary.rds - patient-level summary with all conditions\n")
+cat("  chronic_derm_patient_conditions.rds - condition-to-patient mapping\n")
+cat("  condition_patient_counts.rds - verified patient counts per condition\n")
+cat("  patient_data_for_matching.rds - patient demographics for matching/analysis\n")
+```
