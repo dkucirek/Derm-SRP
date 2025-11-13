@@ -1,0 +1,389 @@
+---
+title: "04: Propensity Score Matching - WITH PI FEEDBACK"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(lme4)
+library(stringr)
+library(MatchIt)
+library(ggplot2)
+library(gt)
+library(scales)
+library(tibble)
+library(tidyr)
+library(magrittr)
+library(htmlwidgets)
+library(epitools)
+
+format_pvalue <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  if (p >= 0.001 & p <= 0.004) return(sprintf("%.3f", p))
+  if (p >= 0.045 & p <= 0.049) return(sprintf("%.3f", p))
+  return(sprintf("%.2f", p))
+}
+
+data_path <- "Z:/Kucirek/"
+output_base_path <- "C:/Users/dkucirek/Documents/Derm-SRP/"
+tables_output_path <- file.path(output_base_path, "tables")
+figures_output_path <- file.path(output_base_path, "figures")
+
+if (!dir.exists(tables_output_path)) dir.create(tables_output_path, recursive = TRUE)
+if (!dir.exists(figures_output_path)) dir.create(figures_output_path, recursive = TRUE)
+
+create_comparison_table <- function(matrix, title, subtitle) {
+  or_result <- epitools::oddsratio(matrix)
+  chisq_result <- chisq.test(matrix)
+  df <- as.data.frame.matrix(matrix)
+  df <- tibble::rownames_to_column(df, "Group")
+  df$Total <- rowSums(matrix)
+  col_names <- names(df)[2:3]
+  positive_col <- col_names[1]
+  negative_col <- col_names[2]
+  df$Proportion <- df[[positive_col]] / df$Total
+  
+  gt(df) %>%
+    cols_label(
+      Group = "Cohort",
+      !!positive_col := positive_col,
+      !!negative_col := negative_col,
+      Total = "Total Patients",
+      Proportion = "Positivity Rate"
+    ) %>%
+    fmt_percent(columns = Proportion, decimals = 1) %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    tab_source_note(
+      source_note = paste0(
+        "Odds Ratio: ", round(or_result$measure[2, 1], 2),
+        " (95% CI: ", round(or_result$measure[2, 2], 2), " - ", round(or_result$measure[2, 3], 2), ")",
+        " | Chi-squared p-value: ", format_pvalue(chisq_result$p.value)
+      )
+    ) %>%
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.bottom.color = "#495057",
+      column_labels.font.weight = "bold",
+      column_labels.font.size = px(13),
+      table.font.size = px(13),
+      table.font.names = c("Arial", "Calibri", "Segoe UI", "sans-serif")
+    )
+}
+
+result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+
+setDT(result_wide_all)
+setDT(chronic_derm_cohort)
+setDT(result_info)
+
+cat("=== DATA VALIDATION ===\n")
+cat("Chronic dermatology cohort encounters:", nrow(chronic_derm_cohort), "\n")
+cat("Chronic dermatology unique patients:", n_distinct(chronic_derm_cohort$mrn_deid), "\n")
+```
+
+### ===== PI FEEDBACK #1: Remove has_psych_condition from Matching =====
+
+```{r}
+cat("\n=== PI FEEDBACK IMPLEMENTED ===\n")
+cat(" REMOVED has_psych_condition from matching\n\n")
+
+patient_data_for_matching <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
+setDT(patient_data_for_matching)
+
+patient_data_df <- as.data.frame(patient_data_for_matching)
+
+if (is.logical(patient_data_df$is_chronic_derm)) {
+  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+} else {
+  patient_data_df$is_chronic_derm_numeric <- patient_data_df$is_chronic_derm
+}
+
+# PI FEEDBACK #1: Removed has_psych_condition
+matching_formula <- as.formula(
+  is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class
+)
+
+m_out <- matchit(
+  matching_formula,
+  data = patient_data_df,
+  method = "nearest",
+  distance = "glm",
+  caliper = 0.2,
+  replace = FALSE,
+  ratio = 20
+)
+
+matched_data <- match.data(m_out)
+matched_data$treat <- m_out$treat[as.numeric(row.names(matched_data))]
+setDT(matched_data)
+
+saveRDS(matched_data, file.path(data_path, "matched_patient_data.rds"))
+summary(m_out)
+```
+
+### Propensity Score Balance Table
+
+```{r}
+balance_summary <- summary(m_out)
+
+smd_before <- as.data.frame(balance_summary$sum.all) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, `Std. Mean Diff. (Before)` = `Std. Mean Diff.`)
+
+smd_after <- as.data.frame(balance_summary$sum.matched) %>%
+  rownames_to_column("Covariate") %>%
+  select(Covariate, `Std. Mean Diff. (After)` = `Std. Mean Diff.`)
+
+smd_table <- dplyr::inner_join(smd_before, smd_after, by = "Covariate")
+
+gt_smd_table <- smd_table %>%
+  gt() %>%
+  tab_header(
+    title = "Figure 1. Propensity Score Balance",
+    subtitle = "WITHOUT prior psychiatric care (per PI feedback)"
+  ) %>%
+  fmt_number(columns = c(`Std. Mean Diff. (Before)`, `Std. Mean Diff. (After)`), decimals = 3) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.bottom.color = "#495057",
+    column_labels.font.weight = "bold"
+  )
+
+print(gt_smd_table)
+```
+
+### Depression Outcomes Analysis
+
+```{r}
+matched_data <- readRDS(file.path(data_path, "matched_patient_data.rds"))
+setDT(matched_data)
+
+matched_mrns <- unique(matched_data$mrn_deid)
+outcome_data <- result_wide_all[mrn_deid %in% matched_mrns]
+outcome_data <- merge(outcome_data, matched_data[, .(mrn_deid, is_chronic_derm)], by = "mrn_deid", all.x = TRUE)
+
+# Patient-level depression status
+patient_depression_status <- outcome_data[, .(
+  ever_clinical = any(phq_clinical, na.rm = TRUE),
+  ever_subclinical = any(phq_subclinical, na.rm = TRUE),
+  max_phq_score = if(any(!is.na(phq_score))) max(phq_score, na.rm = TRUE) else NA_real_,
+  has_phq_data = any(!is.na(phq_score))
+), by = .(mrn_deid, is_chronic_derm)]
+
+# ===== PI FEEDBACK #2: Add PHQ Severity Categories =====
+patient_depression_status[, phq_severity := fcase(
+  is.na(max_phq_score), "No PHQ Data",
+  max_phq_score >= 15, "Severe (15+)",
+  max_phq_score >= 10, "Moderate (10-14)",
+  max_phq_score >= 5, "Mild (5-9)",
+  max_phq_score < 5, "Minimal (<5)"
+)]
+
+cat("\n=== PI FEEDBACK #2: PHQ SEVERITY CATEGORIES ===\n")
+severity_summary <- patient_depression_status[, .N, by = .(is_chronic_derm, phq_severity)]
+print(severity_summary)
+
+# Clinical Depression Analysis
+clinical_table <- table(
+  Group = ifelse(patient_depression_status$is_chronic_derm, "Chronic Derm", "Control"),
+  Clinical = ifelse(patient_depression_status$ever_clinical, "Clinical (10+)", "Not Clinical")
+)
+clinical_table <- clinical_table[, c("Clinical (10+)", "Not Clinical")]
+
+cat("\nClinical Depression (≥10):\n")
+print(clinical_table)
+clinical_gt <- create_comparison_table(clinical_table, "Clinical Depression in Matched Cohort", "PHQ Score ≥10")
+print(clinical_gt)
+
+# Subclinical Depression Analysis
+subclinical_table <- table(
+  Group = ifelse(patient_depression_status$is_chronic_derm, "Chronic Derm", "Control"),
+  Subclinical = ifelse(patient_depression_status$ever_subclinical, "Subclinical (5-9)", "Not Subclinical")
+)
+subclinical_table <- subclinical_table[, c("Subclinical (5-9)", "Not Subclinical")]
+
+cat("\nSubclinical Depression (5-9):\n")
+print(subclinical_table)
+subclinical_gt <- create_comparison_table(subclinical_table, "Subclinical Depression in Matched Cohort", "PHQ Score 5-9")
+print(subclinical_gt)
+```
+
+### ===== PI FEEDBACK #3: Demographic Logistic Regression =====
+
+```{r}
+cat("\n=== PI FEEDBACK #3: LOGISTIC REGRESSION ANALYSIS ===\n")
+
+
+# Merge depression data with demographics
+patient_demo <- merge(patient_depression_status, 
+                     result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)], 
+                     by = "mrn_deid", all.x = FALSE)
+
+# Only chronic derm patients with PHQ data
+chronic_derm_demo <- patient_demo[is_chronic_derm == TRUE & has_phq_data == TRUE]
+
+cat("Analyzing", nrow(chronic_derm_demo), "chronic derm patients with PHQ data\n\n")
+
+# === TABLE 3: CLINICAL DEPRESSION DEMOGRAPHIC LOGISTIC REGRESSION ===
+cat("--- Table 3: Clinical Depression Demographics (Logistic Regression) ---\n\n")
+
+clinical_demo_results <- list()
+
+# Sex (Male vs Female)
+if(length(unique(chronic_derm_demo$sex)) >= 2) {
+  sex_model <- glm(ever_clinical ~ sex, data = chronic_derm_demo[sex %in% c("Male", "Female")], family = binomial)
+  sex_summary <- summary(sex_model)
+  
+  if("sexMale" %in% rownames(coef(sex_summary))) {
+    sex_coef <- coef(sex_summary)["sexMale", ]
+    sex_or <- exp(sex_coef[1])
+    sex_ci <- exp(confint(sex_model)["sexMale", ])
+    sex_p <- sex_coef[4]
+    
+    male_data <- chronic_derm_demo[sex == "Male"]
+    female_data <- chronic_derm_demo[sex == "Female"]
+    male_rate <- sum(male_data$ever_clinical) / nrow(male_data)
+    female_rate <- sum(female_data$ever_clinical) / nrow(female_data)
+    
+    clinical_demo_results[["Sex"]] <- data.frame(
+      Variable = "Sex",
+      Comparison = "Male vs Female",
+      Group1 = paste0(sum(male_data$ever_clinical), "/", nrow(male_data), " (", round(male_rate*100, 1), "%)"),
+      Group2 = paste0(sum(female_data$ever_clinical), "/", nrow(female_data), " (", round(female_rate*100, 1), "%)"),
+      OR_CI = paste0(round(sex_or, 2), " (", round(sex_ci[1], 2), "-", round(sex_ci[2], 2), ")"),
+      P_Value = format_pvalue(sex_p)
+    )
+  }
+}
+
+# Age (<65 vs ≥65)
+chronic_derm_demo[, age_65plus := age_at_encounter >= 65]
+if(length(unique(chronic_derm_demo$age_65plus)) == 2) {
+  age_model <- glm(ever_clinical ~ age_65plus, data = chronic_derm_demo, family = binomial)
+  age_summary <- summary(age_model)
+  
+  if("age_65plusTRUE" %in% rownames(coef(age_summary))) {
+    age_coef <- coef(age_summary)["age_65plusTRUE", ]
+    age_or <- exp(age_coef[1])
+    age_ci <- exp(confint(age_model)["age_65plusTRUE", ])
+    age_p <- age_coef[4]
+    
+    under65_data <- chronic_derm_demo[age_65plus == FALSE]
+    over65_data <- chronic_derm_demo[age_65plus == TRUE]
+    under65_rate <- sum(under65_data$ever_clinical) / nrow(under65_data)
+    over65_rate <- sum(over65_data$ever_clinical) / nrow(over65_data)
+    
+    clinical_demo_results[["Age"]] <- data.frame(
+      Variable = "Age",
+      Comparison = "≥65 vs <65",
+      Group1 = paste0(sum(over65_data$ever_clinical), "/", nrow(over65_data), " (", round(over65_rate*100, 1), "%)"),
+      Group2 = paste0(sum(under65_data$ever_clinical), "/", nrow(under65_data), " (", round(under65_rate*100, 1), "%)"),
+      OR_CI = paste0(round(age_or, 2), " (", round(age_ci[1], 2), "-", round(age_ci[2], 2), ")"),
+      P_Value = format_pvalue(age_p)
+    )
+  }
+}
+
+# Race (Black vs White)
+if(all(c("Black or African American", "White") %in% unique(chronic_derm_demo$race_refined))) {
+  race_subset <- chronic_derm_demo[race_refined %in% c("Black or African American", "White")]
+  race_subset[, race_black := race_refined == "Black or African American"]
+  
+  race_model <- glm(ever_clinical ~ race_black, data = race_subset, family = binomial)
+  race_summary <- summary(race_model)
+  
+  if("race_blackTRUE" %in% rownames(coef(race_summary))) {
+    race_coef <- coef(race_summary)["race_blackTRUE", ]
+    race_or <- exp(race_coef[1])
+    race_ci <- exp(confint(race_model)["race_blackTRUE", ])
+    race_p <- race_coef[4]
+    
+    black_data <- race_subset[race_black == TRUE]
+    white_data <- race_subset[race_black == FALSE]
+    black_rate <- sum(black_data$ever_clinical) / nrow(black_data)
+    white_rate <- sum(white_data$ever_clinical) / nrow(white_data)
+    
+    clinical_demo_results[["Race"]] <- data.frame(
+      Variable = "Race",
+      Comparison = "Black vs White",
+      Group1 = paste0(sum(black_data$ever_clinical), "/", nrow(black_data), " (", round(black_rate*100, 1), "%)"),
+      Group2 = paste0(sum(white_data$ever_clinical), "/", nrow(white_data), " (", round(white_rate*100, 1), "%)"),
+      OR_CI = paste0(round(race_or, 2), " (", round(race_ci[1], 2), "-", round(race_ci[2], 2), ")"),
+      P_Value = format_pvalue(race_p)
+    )
+  }
+}
+
+# Insurance (Medicaid vs Private)
+if(all(c("Medicaid", "Private Payors") %in% unique(chronic_derm_demo$fin_class))) {
+  insurance_subset <- chronic_derm_demo[fin_class %in% c("Medicaid", "Private Payors")]
+  insurance_subset[, medicaid := fin_class == "Medicaid"]
+  
+  insurance_model <- glm(ever_clinical ~ medicaid, data = insurance_subset, family = binomial)
+  insurance_summary <- summary(insurance_model)
+  
+  if("medicaidTRUE" %in% rownames(coef(insurance_summary))) {
+    ins_coef <- coef(insurance_summary)["medicaidTRUE", ]
+    ins_or <- exp(ins_coef[1])
+    ins_ci <- exp(confint(insurance_model)["medicaidTRUE", ])
+    ins_p <- ins_coef[4]
+    
+    medicaid_data <- insurance_subset[medicaid == TRUE]
+    private_data <- insurance_subset[medicaid == FALSE]
+    medicaid_rate <- sum(medicaid_data$ever_clinical) / nrow(medicaid_data)
+    private_rate <- sum(private_data$ever_clinical) / nrow(private_data)
+    
+    clinical_demo_results[["Insurance"]] <- data.frame(
+      Variable = "Insurance",
+      Comparison = "Medicaid vs Private",
+      Group1 = paste0(sum(medicaid_data$ever_clinical), "/", nrow(medicaid_data), " (", round(medicaid_rate*100, 1), "%)"),
+      Group2 = paste0(sum(private_data$ever_clinical), "/", nrow(private_data), " (", round(private_rate*100, 1), "%)"),
+      OR_CI = paste0(round(ins_or, 2), " (", round(ins_ci[1], 2), "-", round(ins_ci[2], 2), ")"),
+      P_Value = format_pvalue(ins_p)
+    )
+  }
+}
+
+# Create Table 3
+if(length(clinical_demo_results) > 0) {
+  clinical_demo_df <- do.call(rbind, clinical_demo_results)
+  
+  table3_clinical <- clinical_demo_df %>%
+    gt() %>%
+    tab_header(
+      title = "Table 3: Clinical Depression Demographic Comparisons (Logistic Regression)",
+      subtitle = "Within chronic derm cohort - PHQ ≥10"
+    ) %>%
+    cols_label(
+      Variable = "Variable",
+      Comparison = "Comparison",
+      Group1 = "Group 1",
+      Group2 = "Group 2",
+      OR_CI = "OR (95% CI)",
+      P_Value = "P"
+    ) %>%
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.bottom.color = "#495057",
+      column_labels.font.weight = "bold"
+    )
+  
+  print(table3_clinical)
+  
+  # Save CSV
+  csv_dir <- "C:/Users/dkucirek/Documents/Derm-SRP/As CSV"
+  if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
+  write.csv(clinical_demo_df, file.path(csv_dir, "Table_3_Clinical_Demographics_Logistic.csv"), row.names = FALSE)
+}
+
+```
