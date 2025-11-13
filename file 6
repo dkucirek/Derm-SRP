@@ -1,0 +1,1340 @@
+---
+title: "06: Individual Chronic Condition Analysis - WITH DR. LAITEERAPONG'S FEEDBACK"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Load Libraries and Data
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(MatchIt)
+library(gt)
+library(scales)
+library(epitools)
+library(tibble)
+library(broom)  # For tidy regression output
+
+# p-value formatting
+format_pvalue_single <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  if (p >= 0.001 & p <= 0.004) return(sprintf("%.3f", p))
+  if (p >= 0.045 & p <= 0.049) return(sprintf("%.3f", p))
+  return(sprintf("%.2f", p))
+}
+
+# Vectorized version for use in mutate/ifelse
+format_pvalue <- Vectorize(format_pvalue_single, vectorize.args = "p")
+
+data_path <- "Z:/Kucirek/"
+output_base_path <- "C:/Users/dkucirek/Documents/Derm-SRP/"
+
+result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+patient_data_for_matching <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
+result_info <- readRDS(file.path(data_path, "result_info.rds"))
+
+setDT(result_wide_all)
+setDT(chronic_derm_cohort)
+setDT(patient_data_for_matching)
+setDT(result_info)
+
+# Remove 'Unknown' sex category
+patient_data_for_matching <- patient_data_for_matching[sex != "Unknown"]
+
+cat("=== FILE 06: UPDATED WITH DR. LAITEERAPONG'S FEEDBACK ===\n")
+cat("Data loaded successfully\n")
+```
+
+## ===== Update ICD Codes (Add M32 for Lupus) =====
+
+```{r}
+cat("\n===  UPDATED ICD CODES ===\n")
+cat("Added M32 code for Systemic Lupus Erythematosus per PI feedback\n\n")
+
+# DR. L FEEDBACK: Added M32 by itself
+chronic_condition_icd_codes <- list(
+  "Scarring Alopecia" = "L66",
+  "Acne" = "L70", 
+  "Atopic Dermatitis" = "L20",
+  "Hidradenitis Suppurativa" = "L73.2",
+  "Rosacea" = "L71",
+  "Vitiligo" = "L80",
+  "Alopecia Areata" = "L63",
+  "Psoriasis" = "L40",
+  "Lupus Erythematosus" = c("L93", "M32", "M32.1", "M32.9")  # ✓ ADDED M32
+)
+
+cat("Lupus codes now include: L93, M32, M32.1, M32.9\n")
+```
+
+## ===== K #2: Remove has_psych_condition from Demographics =====
+
+```{r}
+#  Demographics table function WITHOUT has_psych_condition
+create_condition_demographics_table <- function(before_data, after_data, condition_name, match_summary) {
+  
+  # Helper function for summary statistics
+  summarize_covariate <- function(data, covariate_name, is_continuous = FALSE) {
+    if (is_continuous) {
+      mean_sd_control <- data[is_chronic_derm == FALSE, 
+                              paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                     round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+      mean_sd_treated <- data[is_chronic_derm == TRUE, 
+                              paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
+                                     round(sd(get(covariate_name), na.rm = TRUE)), ")")]
+      
+      return(data.frame(
+        Characteristic = covariate_name,
+        Level = "",
+        Control = mean_sd_control,
+        Treated = mean_sd_treated,
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      total_n_control <- nrow(data[is_chronic_derm == FALSE])
+      total_n_treated <- nrow(data[is_chronic_derm == TRUE])
+      
+      counts_control <- data[is_chronic_derm == FALSE, .N, by = get(covariate_name)]
+      setnames(counts_control, c("Level", "N"))
+      counts_control[, Display := paste0(N, " (", scales::percent(N / total_n_control, accuracy = 1), ")")]
+      
+      counts_treated <- data[is_chronic_derm == TRUE, .N, by = get(covariate_name)]
+      setnames(counts_treated, c("Level", "N"))
+      counts_treated[, Display := paste0(N, " (", scales::percent(N / total_n_treated, accuracy = 1), ")")]
+      
+      merged_counts <- full_join(counts_control %>% select(Level, Control = Display), 
+                                 counts_treated %>% select(Level, Treated = Display), 
+                                 by = "Level")
+      merged_counts[is.na(merged_counts)] <- "0 (0%)"
+      
+      return(data.frame(
+        Characteristic = covariate_name,
+        Level = merged_counts$Level,
+        Control = merged_counts$Control,
+        Treated = merged_counts$Treated,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # Removed has_psych_condition from covariates
+  covariates_continuous <- c("age_at_encounter")
+  covariates_categorical <- c("sex", "race_refined", "ethnic_refined", "fin_class")
+  
+  # Before matching summaries
+  summary_before_list <- list()
+  for (cov in covariates_continuous) {
+    summary_before_list[[cov]] <- summarize_covariate(before_data, cov, is_continuous = TRUE)
+  }
+  for (cov in covariates_categorical) {
+    summary_before_list[[cov]] <- summarize_covariate(before_data, cov, is_continuous = FALSE)
+  }
+  summary_before_df <- bind_rows(summary_before_list)
+  
+  # After matching summaries
+  summary_after_list <- list()
+  for (cov in covariates_continuous) {
+    summary_after_list[[cov]] <- summarize_covariate(after_data, cov, is_continuous = TRUE)
+  }
+  for (cov in covariates_categorical) {
+    summary_after_list[[cov]] <- summarize_covariate(after_data, cov, is_continuous = FALSE)
+  }
+  summary_after_df <- bind_rows(summary_after_list)
+
+  # Combine and format for gt 
+  setnames(summary_before_df, c("Control", "Treated"), c("Control_Before", "Treated_Before"))
+  setnames(summary_after_df, c("Control", "Treated"), c("Control_After", "Treated_After"))
+  
+  final_table_data <- full_join(summary_before_df, summary_after_df, by = c("Characteristic", "Level"))
+  
+  # Reorder race/ethnicity with intuitive ordering
+  characteristic_order <- c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class")
+  final_table_data$Characteristic <- factor(final_table_data$Characteristic, levels = characteristic_order)
+  final_table_data <- final_table_data %>% arrange(Characteristic, Level)
+  
+  # Clean characteristic names
+  final_table_data$Characteristic <- recode(final_table_data$Characteristic,
+    age_at_encounter = "Age, mean (SD)",
+    sex = "Sex",
+    race_refined = "Race",
+    ethnic_refined = "Ethnicity",
+    fin_class = "Insurance Class"
+  )
+  
+  final_table_data <- final_table_data %>% 
+    mutate(Characteristic = as.character(Characteristic)) %>% 
+    group_by(Characteristic) %>% 
+    mutate(Characteristic_Display = ifelse(row_number() == 1, Characteristic, "")) %>% 
+    ungroup()
+  
+  # Get SMDs from match summary
+  smd_before <- as.data.frame(match_summary$sum.all) %>%
+    rownames_to_column("Covariate") %>%
+    select(Covariate, SMD_Before = `Std. Mean Diff.`)
+  
+  smd_after <- as.data.frame(match_summary$sum.matched) %>%
+    rownames_to_column("Covariate") %>%
+    select(Covariate, SMD_After = `Std. Mean Diff.`)
+  
+  smd_table <- inner_join(smd_before, smd_after, by = "Covariate")
+  smd_table$SMD_Before <- round(abs(smd_table$SMD_Before), 3)
+  smd_table$SMD_After <- round(abs(smd_table$SMD_After), 3)
+  
+  # Mapping function to match MatchIt covariate names 
+  map_covariate_to_table <- function(covariate_name) {
+    if (covariate_name == "age_at_encounter") {
+      return(list(char = "Age, mean (SD)", level = ""))
+    } else if (grepl("^sex", covariate_name)) {
+      level <- gsub("^sex", "", covariate_name)
+      return(list(char = "Sex", level = level))
+    } else if (grepl("^race_refined", covariate_name)) {
+      level <- gsub("^race_refined", "", covariate_name)
+      return(list(char = "Race", level = level))
+    } else if (grepl("^ethnic_refined", covariate_name)) {
+      level <- gsub("^ethnic_refined", "", covariate_name)
+      return(list(char = "Ethnicity", level = level))
+    } else if (grepl("^fin_class", covariate_name)) {
+      level <- gsub("^fin_class", "", covariate_name)
+      return(list(char = "Insurance Class", level = level))
+    }
+    return(NULL)
+  }
+  
+  # Add SMD columns to final table data
+  final_table_data$SMD_Before <- ""
+  final_table_data$SMD_After <- ""
+  
+  for (i in 1:nrow(final_table_data)) {
+    char <- final_table_data$Characteristic[i]
+    level <- final_table_data$Level[i]
+    
+    for (j in 1:nrow(smd_table)) {
+      mapping <- map_covariate_to_table(smd_table$Covariate[j])
+      if (!is.null(mapping) && mapping$char == char && mapping$level == level) {
+        final_table_data$SMD_Before[i] <- as.character(smd_table$SMD_Before[j])
+        final_table_data$SMD_After[i] <- as.character(smd_table$SMD_After[j])
+        break
+      }
+    }
+  }
+  
+  # Create demographics table
+  demo_table <- final_table_data %>% 
+    select(Characteristic_Display, Level, Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After) %>% 
+    gt() %>% 
+    cols_label(
+      Characteristic_Display = "Characteristic",
+      Level = "",
+      Control_Before = "Control",
+      Treated_Before = condition_name,
+      SMD_Before = "SMD",
+      Control_After = "Control", 
+      Treated_After = condition_name,
+      SMD_After = "SMD"
+    ) %>% 
+    tab_spanner(label = "Before Matching", columns = c(Control_Before, Treated_Before, SMD_Before)) %>% 
+    tab_spanner(label = "After Matching", columns = c(Control_After, Treated_After, SMD_After)) %>% 
+    tab_header(
+      title = paste("Demographics for", condition_name, "Before and After Propensity Score Matching"),
+      subtitle = "Values are n (%) unless otherwise specified (has_psych_condition REMOVED per PI feedback)"
+    ) %>% 
+    tab_style(
+      style = cell_text(indent = px(20), size = px(13)),
+      locations = cells_body(columns = Level, rows = Level != "")
+    ) %>% 
+    tab_style(
+      style = cell_text(weight = "bold", size = px(14)),
+      locations = cells_body(columns = Characteristic_Display, rows = Characteristic_Display != "")
+    ) %>%
+    tab_style(
+      style = cell_fill(color = "#f8f9fa"),
+      locations = cells_body(rows = seq(2, nrow(final_table_data), 2))
+    ) %>%
+    cols_align(align = "left", columns = c(Characteristic_Display, Level)) %>% 
+    cols_align(align = "center", columns = c(Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After)) %>% 
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.top.width = px(3),
+      table.border.bottom.color = "#495057",
+      table.border.bottom.width = px(2),
+      column_labels.font.weight = "bold",
+      column_labels.font.size = px(13),
+      table.font.size = px(13),
+      table.font.names = c("Arial", "Calibri", "Segoe UI", "Helvetica", "sans-serif"),
+      data_row.padding = px(8)
+    ) %>%
+    tab_footnote(
+      footnote = "SMD <0.1 indicates good balance",
+      locations = cells_column_labels(columns = SMD_Before)
+    ) %>%
+    tab_source_note(
+      source_note = paste("Matching WITHOUT prior psychiatric care per PI feedback")
+    )
+  
+  return(demo_table)
+}
+
+cat("✓ Demographics table function updated: has_psych_condition REMOVED\n")
+```
+
+## Individual Condition Matching (WITHOUT has_psych_condition)
+
+```{r}
+# Get condition-specific patient cohorts
+condition_cohorts <- list()
+
+for (condition_name in names(chronic_condition_icd_codes)) {
+  cat("\n=== PROCESSING", toupper(condition_name), "===\n")
+  
+  icd_codes <- chronic_condition_icd_codes[[condition_name]]
+  condition_pattern <- paste(icd_codes, collapse = "|")
+  
+  # Get patients with this condition
+  condition_patients <- chronic_derm_cohort[str_detect(icd10_dx, condition_pattern), unique(mrn_deid)]
+  
+  if (length(condition_patients) < 50) {
+    cat("Skipping", condition_name, "- insufficient patients (", length(condition_patients), ")\n")
+    next
+  }
+  
+  cat("Found", length(condition_patients), "patients with", condition_name, "\n")
+  
+  # Condition-specific dataset for matching
+  condition_data_for_matching <- copy(patient_data_for_matching)
+  condition_data_for_matching[, is_chronic_derm := mrn_deid %in% condition_patients]
+  
+  # Store before matching data
+  before_matching_data <- copy(condition_data_for_matching)
+  
+  # Propensity score matching WITHOUT has_psych_condition 
+  patient_data_df <- as.data.frame(condition_data_for_matching)
+  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+  
+  cat("Performing propensity score matching for", condition_name, "...\n")
+  
+  tryCatch({
+    # Matching formula WITHOUT has_psych_condition
+    m_out <- matchit(
+      is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class,
+      data = patient_data_df,
+      method = "nearest",
+      distance = "glm",
+      caliper = 0.2,
+      replace = FALSE,
+      ratio = 20
+    )
+    
+    matched_data_condition <- match.data(m_out)
+    matched_data_condition$treat <- m_out$treat[as.numeric(row.names(matched_data_condition))]
+    setDT(matched_data_condition)
+    
+    # Store results
+    condition_cohorts[[condition_name]] <- list(
+      condition_patients = condition_patients,
+      before_matching = before_matching_data,
+      after_matching = matched_data_condition,
+      match_summary = summary(m_out)
+    )
+    
+    cat("Matching completed for", condition_name, "\n")
+    cat("Matched:", sum(matched_data_condition$treat == 1), condition_name, "patients\n")
+    cat("Matched:", sum(matched_data_condition$treat == 0), "control patients\n")
+    
+  }, error = function(e) {
+    cat("Error in matching for", condition_name, ":", e$message, "\n")
+  })
+}
+
+cat("\n=== MATCHING SUMMARY ===\n")
+cat("Successfully processed", length(condition_cohorts), "conditions\n")
+```
+
+## Create Demographics Tables for Each Condition
+
+```{r}
+for (condition_name in names(condition_cohorts)) {
+  cat("\n=== DEMOGRAPHICS TABLE FOR", toupper(condition_name), "===\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  
+  demo_table <- create_condition_demographics_table(
+    before_data = cohort_data$before_matching,
+    after_data = cohort_data$after_matching,
+    condition_name = condition_name,
+    match_summary = cohort_data$match_summary
+  )
+  
+  print(demo_table)
+  
+  # Save tables
+  figures_dir <- file.path(output_base_path, "figures")
+  if (!dir.exists(figures_dir)) dir.create(figures_dir, recursive = TRUE)
+  
+  demo_filename <- file.path(figures_dir, paste0("Demographics_Table_", gsub(" ", "_", condition_name), ".png"))
+  gtsave(data = demo_table, filename = demo_filename)
+}
+```
+
+## =====  Combined Clinical/Subclinical Table =====
+
+```{r}
+cat("\n===  COMBINED CLINICAL/SUBCLINICAL TABLE ===\n")
+
+
+# Helper function to validate PHQ data
+validate_clinical_phq_data <- function(dt) {
+  required_cols <- c("phq_score", "phq_clinical", "phq_subclinical")
+  missing_cols <- setdiff(required_cols, names(dt))
+  
+  if (length(missing_cols) > 0) {
+    warning(paste("Missing PHQ columns:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  if (!"phq_clinical" %in% names(dt)) {
+    dt[, phq_clinical := phq_score >= 10 & !is.na(phq_score)]
+  }
+  if (!"phq_subclinical" %in% names(dt)) {
+    dt[, phq_subclinical := phq_score >= 5 & phq_score <= 9 & !is.na(phq_score)]
+  }
+  
+  return(dt)
+}
+
+# PHQ outcome analysis for each condition
+condition_phq_results <- data.table()
+
+for (condition_name in names(condition_cohorts)) {
+  cat("\n--- Analyzing", condition_name, "---\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  matched_patients <- cohort_data$after_matching
+  
+  condition_patient_ids <- matched_patients[treat == 1, mrn_deid]
+  control_patient_ids <- matched_patients[treat == 0, mrn_deid]
+  
+  # Get PHQ data
+  condition_encounters <- result_wide_all[mrn_deid %in% condition_patient_ids]
+  condition_encounters <- validate_clinical_phq_data(condition_encounters)
+  
+  control_encounters <- result_wide_all[mrn_deid %in% control_patient_ids]
+  control_encounters <- validate_clinical_phq_data(control_encounters)
+  
+  # Patient-level analysis
+  condition_phq_status <- condition_encounters[, .(
+    ever_clinical = any(phq_clinical, na.rm = TRUE),
+    ever_subclinical = any(phq_subclinical, na.rm = TRUE)
+  ), by = mrn_deid]
+  condition_phq_status[, group := condition_name]
+  
+  control_phq_status <- control_encounters[, .(
+    ever_clinical = any(phq_clinical, na.rm = TRUE),
+    ever_subclinical = any(phq_subclinical, na.rm = TRUE)
+  ), by = mrn_deid]
+  control_phq_status[, group := "Control"]
+  
+  # Calculate statistics
+  clinical_matrix <- matrix(c(
+    sum(condition_phq_status$ever_clinical),
+    nrow(condition_phq_status) - sum(condition_phq_status$ever_clinical),
+    sum(control_phq_status$ever_clinical),
+    nrow(control_phq_status) - sum(control_phq_status$ever_clinical)
+  ), nrow = 2, byrow = TRUE)
+  
+  subclinical_matrix <- matrix(c(
+    sum(condition_phq_status$ever_subclinical),
+    nrow(condition_phq_status) - sum(condition_phq_status$ever_subclinical),
+    sum(control_phq_status$ever_subclinical),
+    nrow(control_phq_status) - sum(control_phq_status$ever_subclinical)
+  ), nrow = 2, byrow = TRUE)
+  
+  clinical_chi <- chisq.test(clinical_matrix)
+  subclinical_chi <- chisq.test(subclinical_matrix)
+  
+  clinical_or <- epitools::oddsratio(clinical_matrix)
+  subclinical_or <- epitools::oddsratio(subclinical_matrix)
+  
+  # Store results
+  condition_phq_results <- rbind(condition_phq_results, data.table(
+    Condition = condition_name,
+    N = nrow(condition_phq_status),
+    Control_N = nrow(control_phq_status),
+    # Subclinical (LEFT side)
+    Subclinical_n = sum(condition_phq_status$ever_subclinical),
+    Subclinical_pct = round(mean(condition_phq_status$ever_subclinical) * 100, 1),
+    Control_Subclinical_n = sum(control_phq_status$ever_subclinical),
+    Control_Subclinical_pct = round(mean(control_phq_status$ever_subclinical) * 100, 1),
+    Subclinical_OR = round(subclinical_or$measure[2,1], 2),
+    Subclinical_CI_lower = round(subclinical_or$measure[2,2], 2),
+    Subclinical_CI_upper = round(subclinical_or$measure[2,3], 2),
+    Subclinical_P = subclinical_chi$p.value,
+    # Clinical (RIGHT side)
+    Clinical_n = sum(condition_phq_status$ever_clinical),
+    Clinical_pct = round(mean(condition_phq_status$ever_clinical) * 100, 1),
+    Control_Clinical_n = sum(control_phq_status$ever_clinical),
+    Control_Clinical_pct = round(mean(control_phq_status$ever_clinical) * 100, 1),
+    Clinical_OR = round(clinical_or$measure[2,1], 2),
+    Clinical_CI_lower = round(clinical_or$measure[2,2], 2),
+    Clinical_CI_upper = round(clinical_or$measure[2,3], 2),
+    Clinical_P = clinical_chi$p.value
+  ))
+}
+
+# Combined table with subclinical LEFT of clinical
+combined_table_data <- condition_phq_results %>%
+  mutate(
+    Subclinical_Display = paste0(Subclinical_n, " (", Subclinical_pct, "%)"),
+    Control_Subclinical_Display = paste0(Control_Subclinical_n, " (", Control_Subclinical_pct, "%)"),
+    Subclinical_OR_CI = paste0(Subclinical_OR, " (", Subclinical_CI_lower, "-", Subclinical_CI_upper, ")"),
+    Clinical_Display = paste0(Clinical_n, " (", Clinical_pct, "%)"),
+    Control_Clinical_Display = paste0(Control_Clinical_n, " (", Control_Clinical_pct, "%)"),
+    Clinical_OR_CI = paste0(Clinical_OR, " (", Clinical_CI_lower, "-", Clinical_CI_upper, ")")
+  )
+# Keep ALL columns for later reference (don't use select yet)
+
+# BONFERRONI CORRECTION FOR TABLE 2
+n_conditions_table2 <- nrow(combined_table_data)
+n_tests_table2 <- n_conditions_table2 * 2  # 2 outcomes per condition (subclinical + clinical)
+bonferroni_table2 <- 0.05 / n_tests_table2
+
+cat("\n=== BONFERRONI CORRECTION FOR TABLE 2 ===\n")
+cat("Number of conditions:", n_conditions_table2, "\n")
+cat("Number of tests:", n_tests_table2, "(2 outcomes per condition)\n")
+cat("Bonferroni-corrected threshold:", format_pvalue(bonferroni_table2), "\n")
+
+# Mark Bonferroni significance
+combined_table_data[, Subclinical_Bonf_Sig := Subclinical_P < bonferroni_table2]
+combined_table_data[, Clinical_Bonf_Sig := Clinical_P < bonferroni_table2]
+
+# Count significant results
+n_subclin_sig_uncorr <- sum(combined_table_data$Subclinical_P < 0.05)
+n_subclin_sig_bonf <- sum(combined_table_data$Subclinical_Bonf_Sig)
+n_clinical_sig_uncorr <- sum(combined_table_data$Clinical_P < 0.05)
+n_clinical_sig_bonf <- sum(combined_table_data$Clinical_Bonf_Sig)
+
+cat("\nSubclinical depression results:\n")
+cat("  Significant at p<0.05 (uncorrected):", n_subclin_sig_uncorr, "\n")
+cat("  Significant after Bonferroni:", n_subclin_sig_bonf, "\n")
+
+cat("\nClinical depression results:\n")
+cat("  Significant at p<0.05 (uncorrected):", n_clinical_sig_uncorr, "\n")
+cat("  Significant after Bonferroni:", n_clinical_sig_bonf, "\n")
+
+# Add significance markers to display
+combined_table_data_display <- combined_table_data %>%
+  mutate(
+    Subclinical_P_Display = ifelse(Subclinical_Bonf_Sig, 
+                                   paste0(format_pvalue(Subclinical_P), "*"),
+                                   format_pvalue(Subclinical_P)),
+    Clinical_P_Display = ifelse(Clinical_Bonf_Sig,
+                                paste0(format_pvalue(Clinical_P), "*"),
+                                format_pvalue(Clinical_P))
+  )
+
+combined_phq_table <- combined_table_data_display %>%
+  select(Condition, N, Control_N,
+         Subclinical_Display, Control_Subclinical_Display, Subclinical_OR_CI, Subclinical_P_Display,
+         Clinical_Display, Control_Clinical_Display, Clinical_OR_CI, Clinical_P_Display) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 2. Depression Outcomes by Chronic Dermatologic Condition",
+    subtitle = paste0("Subclinical (PHQ 5-9) and Clinical (PHQ ≥10) Depression - With Bonferroni Correction (", 
+                     n_tests_table2, " tests, α = ", format_pvalue_single(bonferroni_table2), ")")
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    N = "Condition N",
+    Control_N = "Control N",
+    Subclinical_Display = "Condition",
+    Control_Subclinical_Display = "Control",
+    Subclinical_OR_CI = "OR (95% CI)",
+    Subclinical_P_Display = "P",
+    Clinical_Display = "Condition",
+    Control_Clinical_Display = "Control",
+    Clinical_OR_CI = "OR (95% CI)",
+    Clinical_P_Display = "P"
+  ) %>%
+  tab_spanner(label = "Subclinical Depression (5-9)", 
+              columns = c(Subclinical_Display, Control_Subclinical_Display, Subclinical_OR_CI, Subclinical_P_Display)) %>%
+  tab_spanner(label = "Clinical Depression (≥10)", 
+              columns = c(Clinical_Display, Control_Clinical_Display, Clinical_OR_CI, Clinical_P_Display)) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(combined_table_data_display), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    column_labels.font.size = px(13),
+    table.font.size = px(13)
+  ) %>%
+  tab_footnote(
+    footnote = paste0("*Significant after Bonferroni correction (p < ", format_pvalue_single(bonferroni_table2), ")"),
+    locations = cells_column_labels(columns = c(Subclinical_P_Display, Clinical_P_Display))
+  ) %>%
+  tab_source_note("subclinical left, clinical right. Multiple testing correction applied.")
+
+print(combined_phq_table)
+
+# List conditions that survive Bonferroni correction
+cat("\n=== CONDITIONS SIGNIFICANT AFTER BONFERRONI CORRECTION ===\n")
+cat("\nSubclinical Depression (5-9):\n")
+if(n_subclin_sig_bonf > 0) {
+  subclin_sig_conditions <- combined_table_data[Subclinical_Bonf_Sig == TRUE, 
+                                                .(Condition, Rate = Subclinical_pct, P = Subclinical_P)]
+  print(subclin_sig_conditions)
+} else {
+  cat("  None\n")
+}
+
+cat("\nClinical Depression (≥10):\n")
+if(n_clinical_sig_bonf > 0) {
+  clinical_sig_conditions <- combined_table_data[Clinical_Bonf_Sig == TRUE, 
+                                                 .(Condition, Rate = Clinical_pct, P = Clinical_P)]
+  print(clinical_sig_conditions)
+} else {
+  cat("  None\n")
+}
+
+# Save
+csv_dir <- file.path(output_base_path, "As CSV")
+if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
+write.csv(combined_table_data, file.path(csv_dir, "Table_2_Combined_Depression_by_Condition.csv"), row.names = FALSE)
+
+figures_dir <- file.path(output_base_path, "figures")
+gtsave(data = combined_phq_table, filename = file.path(figures_dir, "Table_2_Combined_Depression.png"))
+
+cat("\n Combined subclinical/clinical table created)\n")
+```
+
+## ===== PHQ Severity Categories (10-14, 15+) =====
+
+```{r}
+cat("\n===  PHQ SEVERITY CATEGORIES ===\n")
+
+# Create finer-grained PHQ severity categories
+result_wide_all[, phq_severity_detailed := fcase(
+  is.na(phq_score), "Missing",
+  phq_score < 5, "Minimal (<5)",
+  phq_score >= 5 & phq_score <= 9, "Mild (5-9)",
+  phq_score >= 10 & phq_score <= 14, "Moderate (10-14)",
+  phq_score >= 15, "Moderately Severe/Severe (15+)"
+)]
+
+# Analyze severity distribution by condition
+severity_by_condition <- data.table()
+
+for (condition_name in names(condition_cohorts)) {
+  cat("\n--- Severity Analysis for", condition_name, "---\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  matched_patients <- cohort_data$after_matching
+  
+  condition_patient_ids <- matched_patients[treat == 1, mrn_deid]
+  control_patient_ids <- matched_patients[treat == 0, mrn_deid]
+  
+  # Get worst severity for each patient
+  condition_severity <- result_wide_all[mrn_deid %in% condition_patient_ids, .(
+    worst_severity = phq_severity_detailed[which.max(ifelse(is.na(phq_score), -1, phq_score))]
+  ), by = mrn_deid]
+  condition_severity[, group := condition_name]
+  
+  control_severity <- result_wide_all[mrn_deid %in% control_patient_ids, .(
+    worst_severity = phq_severity_detailed[which.max(ifelse(is.na(phq_score), -1, phq_score))]
+  ), by = mrn_deid]
+  control_severity[, group := "Control"]
+  
+  # Count by severity level
+  condition_counts <- condition_severity[, .N, by = worst_severity]
+  condition_counts[, pct := round(N / sum(N) * 100, 1)]
+  condition_counts[, group := condition_name]
+  
+  control_counts <- control_severity[, .N, by = worst_severity]
+  control_counts[, pct := round(N / sum(N) * 100, 1)]
+  control_counts[, group := "Control"]
+  
+  # Specific comparisons for 10-14 and 15+
+  n_condition_10_14 <- sum(condition_severity$worst_severity == "Moderate (10-14)")
+  n_condition_15plus <- sum(condition_severity$worst_severity == "Moderately Severe/Severe (15+)")
+  n_control_10_14 <- sum(control_severity$worst_severity == "Moderate (10-14)")
+  n_control_15plus <- sum(control_severity$worst_severity == "Moderately Severe/Severe (15+)")
+  
+  total_condition <- nrow(condition_severity)
+  total_control <- nrow(control_severity)
+  
+  # Chi-square tests for each severity level vs all others
+  # 10-14 vs others
+  matrix_10_14 <- matrix(c(
+    n_condition_10_14, total_condition - n_condition_10_14,
+    n_control_10_14, total_control - n_control_10_14
+  ), nrow = 2, byrow = TRUE)
+  
+  chi_10_14 <- tryCatch(chisq.test(matrix_10_14), error = function(e) list(p.value = NA))
+  or_10_14 <- tryCatch(epitools::oddsratio(matrix_10_14), error = function(e) NULL)
+  
+  # 15+ vs others
+  matrix_15plus <- matrix(c(
+    n_condition_15plus, total_condition - n_condition_15plus,
+    n_control_15plus, total_control - n_control_15plus
+  ), nrow = 2, byrow = TRUE)
+  
+  chi_15plus <- tryCatch(chisq.test(matrix_15plus), error = function(e) list(p.value = NA))
+  or_15plus <- tryCatch(epitools::oddsratio(matrix_15plus), error = function(e) NULL)
+  
+  # Store results
+  severity_by_condition <- rbind(severity_by_condition, data.table(
+    Condition = condition_name,
+    N = total_condition,
+    Control_N = total_control,
+    # Mild (5-9)
+    Mild_n = sum(condition_severity$worst_severity == "Mild (5-9)"),
+    Mild_pct = round(mean(condition_severity$worst_severity == "Mild (5-9)") * 100, 1),
+    Control_Mild_n = sum(control_severity$worst_severity == "Mild (5-9)"),
+    Control_Mild_pct = round(mean(control_severity$worst_severity == "Mild (5-9)") * 100, 1),
+    # Moderate (10-14)
+    Moderate_10_14_n = n_condition_10_14,
+    Moderate_10_14_pct = round(n_condition_10_14 / total_condition * 100, 1),
+    Control_Moderate_10_14_n = n_control_10_14,
+    Control_Moderate_10_14_pct = round(n_control_10_14 / total_control * 100, 1),
+    Moderate_OR = if(!is.null(or_10_14)) round(or_10_14$measure[2,1], 2) else NA,
+    Moderate_CI_lower = if(!is.null(or_10_14)) round(or_10_14$measure[2,2], 2) else NA,
+    Moderate_CI_upper = if(!is.null(or_10_14)) round(or_10_14$measure[2,3], 2) else NA,
+    Moderate_P = chi_10_14$p.value,
+    # Severe (15+)
+    Severe_15plus_n = n_condition_15plus,
+    Severe_15plus_pct = round(n_condition_15plus / total_condition * 100, 1),
+    Control_Severe_15plus_n = n_control_15plus,
+    Control_Severe_15plus_pct = round(n_control_15plus / total_control * 100, 1),
+    Severe_OR = if(!is.null(or_15plus)) round(or_15plus$measure[2,1], 2) else NA,
+    Severe_CI_lower = if(!is.null(or_15plus)) round(or_15plus$measure[2,2], 2) else NA,
+    Severe_CI_upper = if(!is.null(or_15plus)) round(or_15plus$measure[2,3], 2) else NA,
+    Severe_P = chi_15plus$p.value
+  ))
+  
+  cat("Moderate (10-14):", n_condition_10_14, "vs", n_control_10_14, "controls\n")
+  cat("Severe (15+):", n_condition_15plus, "vs", n_control_15plus, "controls\n")
+}
+
+# BONFERRONI CORRECTION FOR SEVERITY ANALYSIS
+n_severity_tests <- nrow(severity_by_condition) * 2  # 2 severity levels per condition
+bonferroni_severity <- 0.05 / n_severity_tests
+
+cat("\n=== BONFERRONI CORRECTION FOR SEVERITY ANALYSIS ===\n")
+cat("Total tests:", n_severity_tests, "(9 conditions × 2 severity levels)\n")
+cat("Bonferroni threshold:", format_pvalue(bonferroni_severity), "\n")
+
+# Mark significance
+severity_by_condition[, Moderate_Bonf_Sig := Moderate_P < bonferroni_severity]
+severity_by_condition[, Severe_Bonf_Sig := Severe_P < bonferroni_severity]
+
+n_moderate_sig_uncorr <- sum(severity_by_condition$Moderate_P < 0.05, na.rm = TRUE)
+n_moderate_sig_bonf <- sum(severity_by_condition$Moderate_Bonf_Sig, na.rm = TRUE)
+n_severe_sig_uncorr <- sum(severity_by_condition$Severe_P < 0.05, na.rm = TRUE)
+n_severe_sig_bonf <- sum(severity_by_condition$Severe_Bonf_Sig, na.rm = TRUE)
+
+cat("Moderate (10-14) significant - uncorrected:", n_moderate_sig_uncorr, "\n")
+cat("Moderate (10-14) significant - Bonferroni:", n_moderate_sig_bonf, "\n")
+cat("Severe (15+) significant - uncorrected:", n_severe_sig_uncorr, "\n")
+cat("Severe (15+) significant - Bonferroni:", n_severe_sig_bonf, "\n")
+
+# Create detailed severity table
+severity_table_data <- severity_by_condition %>%
+  mutate(
+    Moderate_Display = paste0(Moderate_10_14_n, " (", Moderate_10_14_pct, "%)"),
+    Control_Moderate_Display = paste0(Control_Moderate_10_14_n, " (", Control_Moderate_10_14_pct, "%)"),
+    Moderate_OR_CI = paste0(Moderate_OR, " (", Moderate_CI_lower, "-", Moderate_CI_upper, ")"),
+    Moderate_P_Display = ifelse(Moderate_Bonf_Sig, 
+                                paste0(format_pvalue(Moderate_P), "*"),
+                                format_pvalue(Moderate_P)),
+    Severe_Display = paste0(Severe_15plus_n, " (", Severe_15plus_pct, "%)"),
+    Control_Severe_Display = paste0(Control_Severe_15plus_n, " (", Control_Severe_15plus_pct, "%)"),
+    Severe_OR_CI = paste0(Severe_OR, " (", Severe_CI_lower, "-", Severe_CI_upper, ")"),
+    Severe_P_Display = ifelse(Severe_Bonf_Sig,
+                              paste0(format_pvalue(Severe_P), "*"),
+                              format_pvalue(Severe_P))
+  )
+
+severity_detailed_table <- severity_table_data %>%
+  select(Condition, N, Control_N,
+         Moderate_Display, Control_Moderate_Display, Moderate_OR_CI, Moderate_P_Display,
+         Severe_Display, Control_Severe_Display, Severe_OR_CI, Severe_P_Display) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 2B. PHQ Severity Categories by Condition",
+    subtitle = paste0("Moderate (10-14) and Severe (15+) Depression - With Bonferroni Correction (",
+                     n_severity_tests, " tests, α = ", format_pvalue(bonferroni_severity), ")")
+  ) %>%
+  cols_label(
+    Condition = "Condition",
+    N = "Condition N",
+    Control_N = "Control N",
+    Moderate_Display = "Condition",
+    Control_Moderate_Display = "Control",
+    Moderate_OR_CI = "OR (95% CI)",
+    Moderate_P_Display = "P",
+    Severe_Display = "Condition",
+    Control_Severe_Display = "Control",
+    Severe_OR_CI = "OR (95% CI)",
+    Severe_P_Display = "P"
+  ) %>%
+  tab_spanner(label = "Moderate Depression (10-14)",
+              columns = c(Moderate_Display, Control_Moderate_Display, Moderate_OR_CI, Moderate_P_Display)) %>%
+  tab_spanner(label = "Severe Depression (15+)",
+              columns = c(Severe_Display, Control_Severe_Display, Severe_OR_CI, Severe_P_Display)) %>%
+  tab_style(
+    style = cell_fill(color = "#f8f9fa"),
+    locations = cells_body(rows = seq(2, nrow(severity_table_data), 2))
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    column_labels.font.size = px(13),
+    table.font.size = px(13)
+  ) %>%
+  tab_footnote(
+    footnote = paste0("*Significant after Bonferroni correction (p < ", format_pvalue(bonferroni_severity), ")"),
+    locations = cells_column_labels(columns = c(Moderate_P_Display, Severe_P_Display))
+  ) %>%
+  tab_source_note("Analysis of PHQ severity categories 10-14 and 15+")
+
+print(severity_detailed_table)
+
+# Save
+write.csv(severity_by_condition, file.path(csv_dir, "Table_2B_PHQ_Severity_Categories.csv"), row.names = FALSE)
+gtsave(data = severity_detailed_table, filename = file.path(figures_dir, "Table_2B_Severity_Categories.png"))
+
+cat("\n✓ PHQ severity categories analysis completed\n")
+```
+
+## ===== Logistic Regression for Each Disease =====
+
+```{r}
+cat("\n===  LOGISTIC REGRESSIONS ===\n")
+
+# For each condition, run logistic regressions within that condition's cohort
+condition_logistic_results <- list()
+
+for (condition_name in names(condition_cohorts)) {
+  cat("\n--- Logistic Regression for", condition_name, "---\n")
+  
+  cohort_data <- condition_cohorts[[condition_name]]
+  matched_patients <- cohort_data$after_matching
+  
+  condition_patient_ids <- matched_patients[treat == 1, mrn_deid]
+  
+  # Get condition patient data with PHQ and demographics
+  condition_encounters <- result_wide_all[mrn_deid %in% condition_patient_ids]
+  condition_encounters <- validate_clinical_phq_data(condition_encounters)
+  
+  # Patient-level summary
+  condition_patient_data <- condition_encounters[, .(
+    ever_clinical = any(phq_clinical, na.rm = TRUE),
+    ever_subclinical = any(phq_subclinical, na.rm = TRUE)
+  ), by = mrn_deid]
+  
+  # Merge with demographics
+  condition_patient_data <- merge(condition_patient_data, 
+                                 result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)],
+                                 by = "mrn_deid", all.x = FALSE)
+  
+  if(nrow(condition_patient_data) < 20) {
+    cat("Skipping", condition_name, "- insufficient patients for regression\n")
+    next
+  }
+  
+  # Clinical Depression Logistic Regression
+  clinical_results <- list()
+  
+  # Sex
+  if(length(unique(condition_patient_data$sex)) >= 2 && sum(condition_patient_data$ever_clinical) >= 5) {
+    tryCatch({
+      sex_model <- glm(ever_clinical ~ sex, data = condition_patient_data[sex %in% c("Male", "Female")], family = binomial)
+      sex_tidy <- tidy(sex_model, conf.int = TRUE, exponentiate = TRUE)
+      if(nrow(sex_tidy) > 1) {
+        clinical_results[["Sex"]] <- data.frame(
+          Variable = "Sex (Male vs Female)",
+          OR = round(sex_tidy$estimate[2], 2),
+          CI_lower = round(sex_tidy$conf.low[2], 2),
+          CI_upper = round(sex_tidy$conf.high[2], 2),
+          P = sex_tidy$p.value[2]
+        )
+      }
+    }, error = function(e) cat("Sex model failed:", e$message, "\n"))
+  }
+  
+  # Age
+  condition_patient_data[, age_65plus := age_at_encounter >= 65]
+  if(length(unique(condition_patient_data$age_65plus)) == 2 && sum(condition_patient_data$ever_clinical) >= 5) {
+    tryCatch({
+      age_model <- glm(ever_clinical ~ age_65plus, data = condition_patient_data, family = binomial)
+      age_tidy <- tidy(age_model, conf.int = TRUE, exponentiate = TRUE)
+      if(nrow(age_tidy) > 1) {
+        clinical_results[["Age"]] <- data.frame(
+          Variable = "Age (≥65 vs <65)",
+          OR = round(age_tidy$estimate[2], 2),
+          CI_lower = round(age_tidy$conf.low[2], 2),
+          CI_upper = round(age_tidy$conf.high[2], 2),
+          P = age_tidy$p.value[2]
+        )
+      }
+    }, error = function(e) cat("Age model failed:", e$message, "\n"))
+  }
+  
+  # Race
+  if(all(c("Black or African American", "White") %in% unique(condition_patient_data$race_refined)) && 
+     sum(condition_patient_data$ever_clinical) >= 5) {
+    tryCatch({
+      race_subset <- condition_patient_data[race_refined %in% c("Black or African American", "White")]
+      race_subset[, race_black := race_refined == "Black or African American"]
+      race_model <- glm(ever_clinical ~ race_black, data = race_subset, family = binomial)
+      race_tidy <- tidy(race_model, conf.int = TRUE, exponentiate = TRUE)
+      if(nrow(race_tidy) > 1) {
+        clinical_results[["Race"]] <- data.frame(
+          Variable = "Race (Black vs White)",
+          OR = round(race_tidy$estimate[2], 2),
+          CI_lower = round(race_tidy$conf.low[2], 2),
+          CI_upper = round(race_tidy$conf.high[2], 2),
+          P = race_tidy$p.value[2]
+        )
+      }
+    }, error = function(e) cat("Race model failed:", e$message, "\n"))
+  }
+  
+  # Insurance
+  if(all(c("Medicaid", "Private Payors") %in% unique(condition_patient_data$fin_class)) && 
+     sum(condition_patient_data$ever_clinical) >= 5) {
+    tryCatch({
+      ins_subset <- condition_patient_data[fin_class %in% c("Medicaid", "Private Payors")]
+      ins_subset[, medicaid := fin_class == "Medicaid"]
+      ins_model <- glm(ever_clinical ~ medicaid, data = ins_subset, family = binomial)
+      ins_tidy <- tidy(ins_model, conf.int = TRUE, exponentiate = TRUE)
+      if(nrow(ins_tidy) > 1) {
+        clinical_results[["Insurance"]] <- data.frame(
+          Variable = "Insurance (Medicaid vs Private)",
+          OR = round(ins_tidy$estimate[2], 2),
+          CI_lower = round(ins_tidy$conf.low[2], 2),
+          CI_upper = round(ins_tidy$conf.high[2], 2),
+          P = ins_tidy$p.value[2]
+        )
+      }
+    }, error = function(e) cat("Insurance model failed:", e$message, "\n"))
+  }
+  
+  if(length(clinical_results) > 0) {
+    condition_logistic_results[[condition_name]] <- do.call(rbind, clinical_results)
+    condition_logistic_results[[condition_name]]$Condition <- condition_name
+    
+    cat("Completed logistic regression for", condition_name, "\n")
+    print(condition_logistic_results[[condition_name]])
+  }
+}
+
+# Combine all logistic results
+if(length(condition_logistic_results) > 0) {
+  all_logistic_results <- do.call(rbind, condition_logistic_results)
+  
+  # BONFERRONI CORRECTION FOR LOGISTIC REGRESSIONS
+  n_total_tests_logistic <- nrow(all_logistic_results)
+  bonferroni_logistic <- 0.05 / n_total_tests_logistic
+  
+  cat("\n=== BONFERRONI CORRECTION FOR LOGISTIC REGRESSIONS ===\n")
+  cat("Total number of tests:", n_total_tests_logistic, "\n")
+  cat("Bonferroni-corrected threshold:", format_pvalue(bonferroni_logistic), "\n")
+  
+  # Mark Bonferroni significance
+  all_logistic_results$Bonf_Significant <- all_logistic_results$P < bonferroni_logistic
+  
+  # Count significant results
+  n_sig_uncorr_log <- sum(all_logistic_results$P < 0.05, na.rm = TRUE)
+  n_sig_bonf_log <- sum(all_logistic_results$Bonf_Significant, na.rm = TRUE)
+  
+  cat("Significant at p<0.05 (uncorrected):", n_sig_uncorr_log, "\n")
+  cat("Significant after Bonferroni:", n_sig_bonf_log, "\n\n")
+  
+  # Display table with Bonferroni markers
+  all_logistic_display <- all_logistic_results %>%
+    mutate(
+      OR_CI = paste0(OR, " (", CI_lower, "-", CI_upper, ")"),
+      P_Display = ifelse(Bonf_Significant, paste0(format_pvalue(P), "*"), format_pvalue(P))
+    )
+  
+  logistic_summary_table <- all_logistic_display %>%
+    select(Condition, Variable, OR_CI, P_Display) %>%
+    gt() %>%
+    tab_header(
+      title = "Demographic Predictors of Clinical Depression by Condition",
+      subtitle = paste0("Logistic regression within each dermatologic condition - With Bonferroni Correction (",
+                       n_total_tests_logistic, " tests, α = ", format_pvalue(bonferroni_logistic), ")")
+    ) %>%
+    cols_label(
+      Condition = "Condition",
+      Variable = "Predictor",
+      OR_CI = "OR (95% CI)",
+      P_Display = "P Value"
+    ) %>%
+    tab_options(
+      table.border.top.color = "#495057",
+      table.border.bottom.color = "#495057",
+      column_labels.font.weight = "bold"
+    ) %>%
+    tab_footnote(
+      footnote = paste0("*Significant after Bonferroni correction (p < ", format_pvalue(bonferroni_logistic), ")"),
+      locations = cells_column_labels(columns = P_Display)
+    ) %>%
+    tab_source_note("Multiple testing correction applied to all demographic comparisons")
+  
+  print(logistic_summary_table)
+  
+  # List significant predictors after Bonferroni
+  cat("\n=== SIGNIFICANT PREDICTORS AFTER BONFERRONI CORRECTION ===\n")
+  if(n_sig_bonf_log > 0) {
+    sig_predictors <- all_logistic_results[Bonf_Significant == TRUE, 
+                                          .(Condition, Variable, OR, CI_lower, CI_upper, P)]
+    print(sig_predictors)
+  } else {
+    cat("None - no predictors survive Bonferroni correction\n")
+  }
+  
+  # Save with Bonferroni info
+  write.csv(all_logistic_results, file.path(csv_dir, "Condition_Logistic_Regressions_Bonferroni.csv"), row.names = FALSE)
+  gtsave(data = logistic_summary_table, filename = file.path(figures_dir, "Condition_Logistic_Regressions_Bonferroni.png"))
+}
+
+cat("\n✓ Logistic regressions completed with Bonferroni correction\n")
+```
+
+## =====  Bonferroni Correction for Pairwise Comparisons =====
+
+```{r}
+cat("\n===  BONFERRONI CORRECTION ===\n")
+
+# Calculate all pairwise comparisons
+condition_names <- names(condition_cohorts)
+n_conditions <- length(condition_names)
+n_comparisons <- choose(n_conditions, 2)
+
+cat("Number of conditions:", n_conditions, "\n")
+cat("Number of pairwise comparisons:", n_comparisons, "\n")
+
+# DR. L FEEDBACK: Apply Bonferroni correction
+bonferroni_threshold <- 0.05 / n_comparisons
+cat("Bonferroni-corrected p-value threshold:", format_pvalue(bonferroni_threshold), "\n\n")
+
+pairwise_results <- data.table()
+
+for(i in 1:(n_conditions-1)) {
+  for(j in (i+1):n_conditions) {
+    condition1 <- condition_names[i]
+    condition2 <- condition_names[j]
+    
+    # Get matched patient IDs for both conditions
+    cohort1 <- condition_cohorts[[condition1]]
+    cohort2 <- condition_cohorts[[condition2]]
+    
+    cond1_ids <- cohort1$after_matching[treat == 1, mrn_deid]
+    cond2_ids <- cohort2$after_matching[treat == 1, mrn_deid]
+    
+    # Get PHQ data
+    cond1_phq <- result_wide_all[mrn_deid %in% cond1_ids, .(
+      ever_clinical = any(phq_clinical, na.rm = TRUE)
+    ), by = mrn_deid]
+    
+    cond2_phq <- result_wide_all[mrn_deid %in% cond2_ids, .(
+      ever_clinical = any(phq_clinical, na.rm = TRUE)
+    ), by = mrn_deid]
+    
+    # Create contingency table
+    comparison_table <- matrix(c(
+      sum(cond1_phq$ever_clinical),
+      nrow(cond1_phq) - sum(cond1_phq$ever_clinical),
+      sum(cond2_phq$ever_clinical),
+      nrow(cond2_phq) - sum(cond2_phq$ever_clinical)
+    ), nrow = 2, byrow = TRUE)
+    
+    # Fisher's exact test (better for small samples)
+    fisher_test <- fisher.test(comparison_table)
+    
+    # Calculate OR
+    or_result <- tryCatch({
+      epitools::oddsratio(comparison_table)
+    }, error = function(e) NULL)
+    
+    # Mark significance with Bonferroni correction
+    is_significant <- fisher_test$p.value < bonferroni_threshold
+    
+    pairwise_results <- rbind(pairwise_results, data.table(
+      Comparison = paste(condition1, "vs", condition2),
+      Condition1 = condition1,
+      Condition2 = condition2,
+      Cond1_Clinical_n = sum(cond1_phq$ever_clinical),
+      Cond1_N = nrow(cond1_phq),
+      Cond1_Rate = round(mean(cond1_phq$ever_clinical) * 100, 1),
+      Cond2_Clinical_n = sum(cond2_phq$ever_clinical),
+      Cond2_N = nrow(cond2_phq),
+      Cond2_Rate = round(mean(cond2_phq$ever_clinical) * 100, 1),
+      OR = if(!is.null(or_result)) round(or_result$measure[2,1], 2) else NA,
+      CI_lower = if(!is.null(or_result)) round(or_result$measure[2,2], 2) else NA,
+      CI_upper = if(!is.null(or_result)) round(or_result$measure[2,3], 2) else NA,
+      P_Value = fisher_test$p.value,
+      Bonferroni_Significant = is_significant
+    ))
+  }
+}
+
+# Sort by p-value
+pairwise_results <- pairwise_results[order(P_Value)]
+
+# Count significant comparisons
+n_significant_uncorrected <- sum(pairwise_results$P_Value < 0.05)
+n_significant_bonferroni <- sum(pairwise_results$Bonferroni_Significant)
+
+cat("\n=== BONFERRONI CORRECTION RESULTS ===\n")
+cat("Comparisons significant at p<0.05 (uncorrected):", n_significant_uncorrected, "\n")
+cat("Comparisons significant after Bonferroni correction (p<", format_pvalue(bonferroni_threshold), "):", n_significant_bonferroni, "\n")
+
+if(n_significant_bonferroni == 0) {
+  cat("\n NO comparisons remain significant after Bonferroni correction\n")
+}
+
+# Create table
+pairwise_table_data <- pairwise_results %>%
+  mutate(
+    Cond1_Display = paste0(Cond1_Clinical_n, "/", Cond1_N, " (", Cond1_Rate, "%)"),
+    Cond2_Display = paste0(Cond2_Clinical_n, "/", Cond2_N, " (", Cond2_Rate, "%)"),
+    OR_CI = paste0(OR, " (", CI_lower, "-", CI_upper, ")"),
+    Significance = ifelse(Bonferroni_Significant, "Yes*", 
+                         ifelse(P_Value < 0.05, "No (p<0.05 uncorrected)", "No"))
+  ) %>%
+  select(Comparison, Cond1_Display, Cond2_Display, OR_CI, P_Value, Significance, Bonferroni_Significant)
+
+pairwise_table <- pairwise_table_data %>%
+  gt() %>%
+  tab_header(
+    title = "Table 4. Pairwise Clinical Depression Comparisons Between Conditions",
+    subtitle = paste0("With Bonferroni correction (", n_comparisons, " comparisons, α = ", format_pvalue(bonferroni_threshold), ")")
+  ) %>%
+  cols_label(
+    Comparison = "Comparison",
+    Cond1_Display = "Condition 1",
+    Cond2_Display = "Condition 2",
+    OR_CI = "OR (95% CI)",
+    P_Value = "P Value",
+    Significance = "Bonferroni Significant"
+  ) %>%
+  cols_hide(columns = Bonferroni_Significant) %>%
+  fmt_number(columns = P_Value, decimals = 4) %>%
+  tab_style(
+    style = cell_fill(color = "#fff3cd"),
+    locations = cells_body(rows = Bonferroni_Significant == TRUE)
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.bottom.color = "#495057",
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_footnote(
+    footnote = paste0("*Significant after Bonferroni correction (p < ", format_pvalue(bonferroni_threshold), ")"),
+    locations = cells_column_labels(columns = Significance)
+  ) %>%
+  tab_source_note("Multiple comparisons require Bonferroni correction")
+
+print(pairwise_table)
+
+# Save
+write.csv(pairwise_results, file.path(csv_dir, "Table_4_Pairwise_Comparisons_Bonferroni.csv"), row.names = FALSE)
+gtsave(data = pairwise_table, filename = file.path(figures_dir, "Table_4_Pairwise_Bonferroni.png"))
+
+cat("\n Pairwise comparisons completed with Bonferroni correction\n")
+```
+
+## Comprehensive Bonferroni Correction Summary
+
+```{r}
+cat("\n=== COMPREHENSIVE BONFERRONI SUMMARY ===\n\n")
+
+# Create comprehensive comparison table
+bonferroni_all_tests <- data.table(
+  Test_Family = c("Depression Outcomes (Table 2)", 
+                  "Severity Categories (Table 2B)",
+                  "Logistic Regressions",
+                  "Pairwise Comparisons (Table 4)"),
+  N_Tests = c(n_tests_table2, n_severity_tests, n_total_tests_logistic, n_comparisons),
+  Bonf_Threshold = c(bonferroni_table2, bonferroni_severity, bonferroni_logistic, bonferroni_threshold),
+  Sig_Uncorrected = c(
+    n_subclin_sig_uncorr + n_clinical_sig_uncorr,
+    n_moderate_sig_uncorr + n_severe_sig_uncorr,
+    n_sig_uncorr_log,
+    n_significant_uncorrected
+  ),
+  Sig_Bonferroni = c(
+    n_subclin_sig_bonf + n_clinical_sig_bonf,
+    n_moderate_sig_bonf + n_severe_sig_bonf,
+    n_sig_bonf_log,
+    n_significant_bonferroni
+  )
+)
+
+bonferroni_all_tests[, Percent_Survived := round(Sig_Bonferroni / Sig_Uncorrected * 100, 1)]
+bonferroni_all_tests[is.nan(Percent_Survived), Percent_Survived := 0]
+
+# Display summary table
+bonferroni_comprehensive_table <- bonferroni_all_tests %>%
+  mutate(
+    Threshold_Display = format_pvalue(Bonf_Threshold),
+    Change_Display = paste0(Sig_Uncorrected, " → ", Sig_Bonferroni)
+  ) %>%
+  select(Test_Family, N_Tests, Threshold_Display, Change_Display, Percent_Survived) %>%
+  gt() %>%
+  tab_header(
+    title = "Comprehensive Bonferroni Correction Summary",
+    subtitle = "Impact of multiple testing correction across all four test families"
+  ) %>%
+  cols_label(
+    Test_Family = "Analysis Type",
+    N_Tests = "Total Tests",
+    Threshold_Display = "Corrected α",
+    Change_Display = "Sig. Before → After",
+    Percent_Survived = "% Survived"
+  ) %>%
+  fmt_number(columns = Percent_Survived, decimals = 1, suffix = "%") %>%
+  tab_style(
+    style = cell_fill(color = "#d4edda"),
+    locations = cells_body(rows = Percent_Survived > 0)
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#f8d7da"),
+    locations = cells_body(rows = Percent_Survived == 0)
+  ) %>%
+  tab_options(
+    table.border.top.color = "#495057",
+    table.border.top.width = px(3),
+    table.border.bottom.color = "#495057",
+    table.border.bottom.width = px(2),
+    column_labels.font.weight = "bold",
+    table.font.size = px(13)
+  ) %>%
+  tab_source_note("Green = some findings survived; Red = no findings survived correction") %>%
+  tab_footnote(
+    footnote = "Four independent test families, each with separate Bonferroni correction applied",
+    locations = cells_column_labels(columns = Test_Family)
+  )
+
+print(bonferroni_comprehensive_table)
+
+# Save
+write.csv(bonferroni_all_tests, file.path(csv_dir, "Bonferroni_All_Tests_Summary.csv"), row.names = FALSE)
+gtsave(data = bonferroni_comprehensive_table, filename = file.path(figures_dir, "Bonferroni_Comprehensive_Summary.png"))
+
+cat("\n=== FINDINGS THAT SURVIVED BONFERRONI CORRECTION ===\n\n")
+
+# Total findings
+total_sig_before <- sum(bonferroni_all_tests$Sig_Uncorrected)
+total_sig_after <- sum(bonferroni_all_tests$Sig_Bonferroni)
+
+cat("OVERALL SUMMARY:\n")
+cat("Total significant findings (uncorrected):", total_sig_before, "\n")
+cat("Total significant findings (Bonferroni):", total_sig_after, "\n")
+cat("Survival rate:", round(total_sig_after / total_sig_before * 100, 1), "%\n\n")
+
+# Print details for each test family
+for(i in 1:nrow(bonferroni_all_tests)) {
+  cat(paste0(i, ". ", bonferroni_all_tests$Test_Family[i], ":\n"))
+  cat("   ", bonferroni_all_tests$Sig_Bonferroni[i], "of", bonferroni_all_tests$Sig_Uncorrected[i], 
+      "findings survived (", bonferroni_all_tests$Percent_Survived[i], "%)\n")
+  
+  # Print specific survivors for each family
+  if(i == 1 && (n_subclin_sig_bonf + n_clinical_sig_bonf) > 0) {
+    cat("   Survivors: ")
+    if(n_subclin_sig_bonf > 0) {
+      survivors <- combined_table_data[Subclinical_Bonf_Sig == TRUE | Clinical_Bonf_Sig == TRUE, Condition]
+      cat(paste(unique(survivors), collapse = ", "), "\n")
+    }
+  } else if(i == 2 && (n_moderate_sig_bonf + n_severe_sig_bonf) > 0) {
+    cat("   Survivors: ")
+    survivors <- severity_by_condition[Moderate_Bonf_Sig == TRUE | Severe_Bonf_Sig == TRUE, Condition]
+    cat(paste(unique(survivors), collapse = ", "), "\n")
+  } else if(i == 3 && n_sig_bonf_log > 0) {
+    survivors <- all_logistic_results[Bonf_Significant == TRUE]
+    cat("   Survivors:\n")
+    for(j in 1:nrow(survivors)) {
+      cat("     ", survivors$Condition[j], "-", survivors$Variable[j], "(p=", format_pvalue(survivors$P[j]), ")\n")
+    }
+  } else if(bonferroni_all_tests$Sig_Bonferroni[i] == 0) {
+    cat("   None\n")
+  }
+  cat("\n")
+}
+
+cat("✓ Comprehensive Bonferroni correction summary complete\n")
+```
+
+## Summary and Save Results
+
+```{r}
+cat("\n=== ALL DR. LAITEERAPONG FEEDBACK IMPLEMENTED ===\n")
+cat("✓ #1: Added M32 code for lupus\n")
+cat("✓ #2: Removed has_psych_condition from matching\n")
+cat("✓ #3: Reordered race/ethnicity intuitively\n")
+cat("✓ #4: Combined subclinical/clinical table (subclinical LEFT)\n")
+cat("✓ #5: Logistic regressions for each disease\n")
+cat("✓ #6: Bonferroni correction applied to ALL multiple comparisons\n")
+cat("✓ #7: PHQ severity categories (10-14, 15+) analyzed\n\n")
+
+cat("=== BONFERRONI CORRECTIONS SUMMARY ===\n")
+cat("Four separate families of tests with corrections applied:\n\n")
+
+cat("1. TABLE 2 - Depression Outcomes by Condition:\n")
+cat("   Tests:", n_tests_table2, "(9 conditions × 2 outcomes)\n")
+cat("   Threshold: p <", format_pvalue(bonferroni_table2), "\n")
+cat("   Subclinical significant:", n_subclin_sig_bonf, "of", n_conditions_table2, "\n")
+cat("   Clinical significant:", n_clinical_sig_bonf, "of", n_conditions_table2, "\n\n")
+
+cat("2. TABLE 2B - PHQ Severity Categories (10-14, 15+):\n")
+cat("   Tests:", n_severity_tests, "(9 conditions × 2 severity levels)\n")
+cat("   Threshold: p <", format_pvalue(bonferroni_severity), "\n")
+cat("   Moderate (10-14) significant:", n_moderate_sig_bonf, "of", n_conditions_table2, "\n")
+cat("   Severe (15+) significant:", n_severe_sig_bonf, "of", n_conditions_table2, "\n\n")
+
+cat("3. LOGISTIC REGRESSIONS - Demographic Predictors:\n")
+cat("   Tests:", n_total_tests_logistic, "(various conditions × 4 predictors)\n")
+cat("   Threshold: p <", format_pvalue(bonferroni_logistic), "\n")
+cat("   Significant predictors:", n_sig_bonf_log, "of", n_total_tests_logistic, "\n\n")
+
+cat("4. TABLE 4 - Pairwise Condition Comparisons:\n")
+cat("   Tests:", n_comparisons, "(36 pairwise comparisons)\n")
+cat("   Threshold: p <", format_pvalue(bonferroni_threshold), "\n")
+cat("   Significant comparisons:", n_significant_bonferroni, "of", n_comparisons, "\n\n")
+
+# Save all condition results for downstream use
+saveRDS(condition_cohorts, file.path(data_path, "condition_cohorts_updated.rds"))
+saveRDS(condition_phq_results, file.path(data_path, "condition_phq_results_updated.rds"))
+saveRDS(pairwise_results, file.path(data_path, "pairwise_results_bonferroni.rds"))
+saveRDS(severity_by_condition, file.path(data_path, "severity_by_condition.rds"))
+
+# Save Bonferroni thresholds for reference
+bonferroni_summary <- data.table(
+  Analysis = c("Table 2 - Depression Outcomes", "Table 2B - Severity Categories", "Logistic Regressions", "Pairwise Comparisons"),
+  N_Tests = c(n_tests_table2, n_severity_tests, n_total_tests_logistic, n_comparisons),
+  Threshold = c(bonferroni_table2, bonferroni_severity, bonferroni_logistic, bonferroni_threshold),
+  Sig_Uncorrected = c(n_subclin_sig_uncorr + n_clinical_sig_uncorr, n_moderate_sig_uncorr + n_severe_sig_uncorr, n_sig_uncorr_log, n_significant_uncorrected),
+  Sig_Bonferroni = c(n_subclin_sig_bonf + n_clinical_sig_bonf, n_moderate_sig_bonf + n_severe_sig_bonf, n_sig_bonf_log, n_significant_bonferroni)
+)
+
+write.csv(bonferroni_summary, file.path(csv_dir, "Bonferroni_Corrections_Summary.csv"), row.names = FALSE)
+
+cat("Updated results saved to:", data_path, "\n")
+cat("Bonferroni summary saved to:", file.path(csv_dir, "Bonferroni_Corrections_Summary.csv"), "\n")
+cat("\n=== FILE 06 COMPLETE WITH COMPREHENSIVE BONFERRONI CORRECTIONS ===\n")
+```
