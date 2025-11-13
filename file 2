@@ -1,0 +1,255 @@
+---
+title: "02: Demographic and Data Preparation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Libraries and Data
+
+```{r}
+library(data.table)
+library(gtsummary)
+library(stringr)
+library(dplyr)
+library(gt)
+
+#Configuration
+data_path <- "Z:/Kucirek/"
+
+#load
+result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
+setDT(result_wide)
+
+#check that required PHQ columns from 01 exist
+required_cols <- c("phq_score", "phq_type_used", "phq_severity", "phq_clinical", "phq_subclinical")
+missing_cols <- setdiff(required_cols, names(result_wide))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Error: The following required PHQ columns are missing from result_wide.rds:", 
+             paste(missing_cols, collapse = ", "), 
+             "\nPlease re-run '01_joining_and_cohort_definition.Rmd' to regenerate the data files."))
+}
+```
+
+### Create `result_info`
+
+```{r}
+#make result_info by merging result_wide with demo_data 
+result_info <- unique(result_wide[, .(mrn_deid, age_at_encounter, fin_class, race, ethnic, sex)], by = "mrn_deid")
+
+#standardize fin_class categories 
+result_info[, fin_class := str_to_title(fin_class)]
+result_info[fin_class == "Comercial", fin_class := "Commercial"]
+
+# combine Blue Cross/Blue Shield with Private Payors
+result_info[fin_class %in% c("Blue Cross/Blue Shield", "Private Payors"), fin_class := "Private Payors"]
+
+# put small insurance classes into 'other'
+result_info[, fin_class := fcase(
+  fin_class %in% c("Ppo", "Hmo/Pos", "Miscellaneous", "Commercial", "", "Grants & Funds"), "Other",
+  default = fin_class
+)]
+
+result_info[, ethnic_refined := fcase(
+  ethnic %in% c("Mexican, Mexican American, or Chicano/a", "Hispanic or Latino", "Puerto Rican", "Cuban", "Other Hispanic, Latino/a, or Spanish origin"), "Hispanic / Latino",
+  ethnic == "Not Hispanic, Latino/a, or Spanish origin", "Not Hispanic / Latino",
+  ethnic == "Patient declines to respond", "NA",
+  ethnic == "Unknown or Patient unable to respond", "Other",
+  default = "Other"
+)]
+
+result_info[, race_refined := fcase(
+  race %in% c("Asian Indian", "Asian/Mideast Indian"), "South Asian",
+  race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese", "Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan", "American Indian or Alaska Native", "None of the above", "Other"), "Other",
+  race == "White", "White",
+  race == "Black or African-American", "Black or African American",
+  race == "More than one Race", "More than one Race",
+  race %in% c("Patient declines to respond", "Unknown or Patient unable to respond"), "Declined/NA",
+  default = "Other"
+)]
+
+# save result_info.rds 
+saveRDS(result_info, file.path(data_path, "result_info.rds"))
+cat(paste("result_info.rds saved to:", data_path, "\n"))
+```
+
+### Prepare Data for Propensity Score Matching
+
+```{r}
+# load required data files
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+chronic_derm_phq_summary <- readRDS(file.path(data_path, "chronic_derm_phq_summary.rds"))
+setDT(chronic_derm_cohort)
+setDT(chronic_derm_phq_summary)
+
+# define chronic derm patients 
+chronic_derm_mrns <- unique(chronic_derm_cohort$mrn_deid)
+
+# Safety check
+if (length(chronic_derm_mrns) == 0) {
+  warning("No chronic derm patients found in loaded cohort - check File 01 processing!")
+}
+
+# Create final consistent dataset: chronic derm patients (already have PHQ data by inclusion criteria) WITH complete demographic data
+chronic_derm_with_phq <- chronic_derm_mrns  # All chronic derm patients now have PHQ data by design
+cat("Chronic derm patients with PHQ data:", length(chronic_derm_with_phq), "(100% by File 01 inclusion criteria)\n")
+
+patient_data_for_matching <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)]
+patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_with_phq]
+
+# prepare covariates
+patient_data_for_matching[, sex := factor(sex)]
+patient_data_for_matching[, race_refined := factor(race_refined)]
+patient_data_for_matching[, ethnic_refined := factor(ethnic_refined)]
+patient_data_for_matching[, fin_class := factor(fin_class)]
+
+# calculate approximate number of visits
+patient_visits <- result_wide[, .N, by = mrn_deid]
+setnames(patient_visits, "N", "num_visits")
+
+# id preexisting psych care
+psych_patterns <- c("BEHAVIORAL", "COLLABORATIVE", "PSYCH", "KOVLER", "MENTAL HEALTH", "COUNSELING") # Added broader terms
+psych_regex <- paste(psych_patterns, collapse = "|")
+
+# id all psych encounters and their dates
+all_psych_encounters <- result_wide[str_detect(toupper(appt_dept), psych_regex)]
+
+# get first psych visit date per patient
+first_psych_dates <- all_psych_encounters[, .(first_psych_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
+
+# get first chronic derm visit date per patient
+first_derm_dates <- chronic_derm_cohort[, .(first_chronic_derm_visit = min(enc_date, na.rm = TRUE)), by = "mrn_deid"]
+
+# merge psych and derm first visit dates
+patient_first_visits <- merge(first_psych_dates, first_derm_dates, by = "mrn_deid", all.x = TRUE, all.y = TRUE)
+
+# define has_psych_condition based on timing
+# For chronic derm patients: needs behavioral care visit before chronic derm diagnosis
+# For control patients: any psychiatric visit counts (no chronic derm timing constraint)
+patient_first_visits[, has_psych_condition_timed := ifelse(
+  !is.na(first_chronic_derm_visit), 
+  # Chronic derm patients: psych visit must be before derm visit
+  !is.na(first_psych_visit) & (first_psych_visit < first_chronic_derm_visit),
+  # Control patients: any psych visit counts
+  !is.na(first_psych_visit)
+)]
+patient_first_visits[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
+
+# merge num_visits and has_psych_condition_timed into patient_data_for_matching
+patient_data_for_matching <- merge(patient_data_for_matching, patient_visits, by = "mrn_deid", all.x = TRUE)
+patient_data_for_matching <- merge(patient_data_for_matching, patient_first_visits[, .(mrn_deid, has_psych_condition_timed)], by = "mrn_deid", all.x = TRUE)
+
+#make sure has_psych_condition is always present and correctly factored
+patient_data_for_matching[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
+patient_data_for_matching[, has_psych_condition := factor(has_psych_condition_timed, levels = c(FALSE, TRUE))]
+
+# get all unique department names that matched the psych patterns (for reporting)
+all_matched_dept_names <- unique(all_psych_encounters$appt_dept)
+matched_dept_names_table <- data.table(matched_dept_name = all_matched_dept_names)
+
+# Display in terminal
+cat("\n=== MATCHED PSYCHIATRIC DEPARTMENT NAMES ===\n")
+print(matched_dept_names_table)
+
+# Save to file
+matched_dept_names_output_path <- file.path(data_path, "matched_psych_department_names.csv")
+fwrite(matched_dept_names_table, matched_dept_names_output_path)
+cat(paste0("List of matched psychiatric department names saved to: ", matched_dept_names_output_path, "\n"))
+
+# Apply final filtering to keep only patients with complete data for matching
+initial_rows <- nrow(patient_data_for_matching)
+initial_chronic_derm <- sum(patient_data_for_matching$is_chronic_derm)
+
+# Filter to only patients with complete data AND adjust chronic derm status
+complete_data_patients <- patient_data_for_matching[!is.na(age_at_encounter) & !is.na(sex) & 
+                                                   !is.na(race_refined) & !is.na(ethnic_refined) & 
+                                                   !is.na(fin_class) & !is.na(num_visits) & 
+                                                   !is.na(has_psych_condition)]
+
+# For chronic derm patients: only keep those with complete data
+chronic_derm_final <- complete_data_patients[is_chronic_derm == TRUE, mrn_deid]
+cat("Final chronic derm patients (complete covariates, PHQ guaranteed by File 01):", length(chronic_derm_final), "\n")
+
+# Keep all control patients with complete data, only chronic derm patients with complete data
+patient_data_for_matching <- complete_data_patients
+patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_final]
+
+cat(paste0("Removed ", initial_rows - nrow(patient_data_for_matching), " rows due to missing covariate data.\n"))
+cat(paste0("Final chronic derm patients in matching dataset: ", sum(patient_data_for_matching$is_chronic_derm), "\n"))
+
+# make sure column names are clean 
+current_names <- names(patient_data_for_matching)
+for (col_name in c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class")) {
+  if (paste0(col_name, ".y") %in% current_names) {
+    setnames(patient_data_for_matching, paste0(col_name, ".y"), col_name)
+  }
+}
+
+# save data
+output_prepared_data_rds <- file.path(data_path, "patient_data_for_matching.rds")
+saveRDS(patient_data_for_matching, output_prepared_data_rds)
+
+cat(paste("Prepared data for propensity score matching saved to:", output_prepared_data_rds, "\n"))
+
+cat("Summary of prepared data:\n")
+print(patient_data_for_matching[, .N, by = is_chronic_derm])
+cat("VERIFICATION: Chronic derm patients in saved file:", sum(patient_data_for_matching$is_chronic_derm), "\n")
+
+```
+
+### Analyze Specific Chronic Derm ICD Codes
+
+```{r}
+icd_codes_of_interest <- c(
+  "L66",   # Cicatricial alopecia
+  "L70",   # Acne
+  "L20",   # Atopic dermatitis
+  "L73.2", # Hidradenitis suppurativa
+  "L71",   # Rosacea
+  "L80",   # Vitiligo
+  "L63",   # Alopecia areata
+  "L40",   # Psoriasis
+  "L93",   # Lupus erythematosus
+  "M32.9", # Systemic lupus erythematosus, unspecified
+  "M32.1"  # Systemic lupus erythematosus, other
+)
+
+pattern <- paste(icd_codes_of_interest, collapse = "|")
+
+filtered_encounters <- result_wide[str_detect(icd10_dx, pattern)]
+
+# summarize, show results 
+if (nrow(filtered_encounters) > 0) {
+  filtered_encounters[, icd_category := str_extract(icd10_dx, paste(icd_codes_of_interest, collapse = "|"))]
+
+  icd_counts <- filtered_encounters[, .N, by = icd_category][order(-N)]
+
+  results_list <- filtered_encounters[, .(
+    mrn_deid,
+    icd_category,
+    icd10_dx,
+    icd_diagnosis,
+    appt_dept
+  )]
+
+  # Display in terminal
+  cat("\n=== SPECIFIC ICD ENCOUNTERS ===\n")
+  print(results_list)
+  
+  #save to CSV
+  output_file <- "specific_icd_encounters.csv"
+  fwrite(results_list, file.path(data_path, output_file))
+}
+
+# Save PHQ severity summary for later use
+cat("Saving PHQ severity summary data...\n")
+
+# Display in terminal
+cat("\n=== CHRONIC DERM PHQ SEVERITY SUMMARY ===\n")
+print(chronic_derm_phq_summary)
+
+fwrite(chronic_derm_phq_summary, file.path(data_path, "chronic_derm_phq_severity_summary.csv"))
+```
