@@ -437,4 +437,26 @@ pd <- readRDS("Z:/Kucirek/patient_data_for_matching.rds")
 setDT(pd)
 print(as.data.frame(pd[, .N, by = .(race_ethnicity_combined, is_chronic_derm)][
   order(is_chronic_derm, race_ethnicity_combined)]))
+
+cat("\n=== TABLE 1 DEMOGRAPHICS (FULL BREAKDOWN) ===\n")
+
+cat("\nInsurance by group:\n")
+print(patient_data_for_matching[, .N, by = .(fin_class, is_chronic_derm)][
+  order(is_chronic_derm, fin_class)])
+
+cat("\nSex by group (including unknown):\n")
+print(patient_data_for_matching[, .N, by = .(sex, is_chronic_derm)][
+  order(is_chronic_derm, sex)])
+
+cat("\nPrior psych care by group:\n")
+print(patient_data_for_matching[, .N, by = .(has_psych_condition, is_chronic_derm)][
+  order(is_chronic_derm, has_psych_condition)])
+
+cat("\nAge by group (mean, SD, median, n):\n")
+print(patient_data_for_matching[, .(
+  mean_age = round(mean(age_at_encounter, na.rm=TRUE), 1),
+  sd_age = round(sd(age_at_encounter, na.rm=TRUE), 1),
+  median_age = median(age_at_encounter, na.rm=TRUE),
+  n = .N
+), by = is_chronic_derm])
 ```
