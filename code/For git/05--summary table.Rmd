@@ -1,303 +1,374 @@
 ---
-title: "05: Summary Table"
+title: "05: Plots"
 output: html_document
 ---
 
+This script is the fifth and final step in the analysis pipeline. It performs the following actions:
+
+1.  **Loads Cohort Data**: It loads the `result_wide.rds`, `chronic_derm_cohort.rds`, and `derm_clinic_cohort.rds` files created in the previous steps.
+2.  **Generates Plots**: It generates a series of plots to visualize the results of the analyses, including:
+    *   A comparison of PHQ positivity rates between the "Derm Clinic" and "Non-Derm" cohorts.
+    *   A comparison of PHQ positivity rates for various dermatological conditions.
+    *   A plot of dermatological conditions with significantly higher PHQ positivity rates.
+    *   A plot of encounter counts for specific dermatological ICD-10 codes.
+    *   A Sankey diagram showing the change in patient PHQ-2 status after a chronic derm diagnosis.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-# Set a local directory for cache and temporary files to avoid pathing issues
-knitr::opts_knit$set(base.dir = normalizePath('.'))
-knitr::opts_chunk$set(cache.path = "rmd_cache/")
 ```
 
-
-### Table 1: Propensity Score Matching Balance
+### Load Libraries and Data
 
 ```{r}
-# helper function for summary stats and P-values
-summarize_covariate <- function(data, covariate_name, is_continuous = FALSE) {
-  summary_list <- list()
-  
-  total_n_control <- nrow(data[is_chronic_derm == FALSE])
-  total_n_treated <- nrow(data[is_chronic_derm == TRUE])
+library(data.table)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(RColorBrewer)
+library(networkD3)
+library(htmlwidgets)
 
-  if (is_continuous) {
-    mean_sd_control <- data[is_chronic_derm == FALSE, 
-                            paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
-                                   round(sd(get(covariate_name), na.rm = TRUE)), ")")]
-    mean_sd_treated <- data[is_chronic_derm == TRUE, 
-                            paste0(round(mean(get(covariate_name), na.rm = TRUE)), " (", 
-                                   round(sd(get(covariate_name), na.rm = TRUE)), ")")]
-    
-    summary_list[[covariate_name]] <- data.frame(
-      Characteristic = covariate_name,
-      Level = "",
-      Control = mean_sd_control,
-      Treated = mean_sd_treated,
-      stringsAsFactors = FALSE
+# --- Configuration: Set your data path here ---
+data_path <- "Z:/Kucirek/"
+
+# --- Load Pre-processed Data ---
+result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
+chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+derm_clinic_cohort <- readRDS(file.path(data_path, "derm_clinic_cohort.rds"))
+
+setDT(result_wide_all)
+setDT(chronic_derm_cohort)
+setDT(derm_clinic_cohort)
+```
+
+### Derm vs. Non-Derm Plots
+
+```{r}
+# --- Helper Functions ---
+calculate_phq_positivity_dt <- function(dt) {
+  if (nrow(dt) == 0) return(list(n_patients = 0, phq2_pos_count = 0, phq9_pos_count = 0))
+  phq_summary <- dt[, .(
+    phq2_pos = any((`phq_value_CMS PHQ-2 POS/NEG` == "Positive") | (phq2_manual_posneg == "Positive"), na.rm = TRUE),
+    phq9_pos = any((`phq_value_CMS PHQ-9 POS/NEG` == "Positive") |
+                   (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) |
+                   (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)
+  ), by = mrn_deid]
+  return(list(
+    n_patients = uniqueN(phq_summary$mrn_deid),
+    phq2_pos_count = sum(phq_summary$phq2_pos, na.rm = TRUE),
+    phq9_pos_count = sum(phq_summary$phq9_pos, na.rm = TRUE)
+  ))
+}
+
+get_p_value <- function(group1_stats, group2_stats, phq_type) {
+  pos1 <- if (phq_type == "PHQ-2") group1_stats$phq2_pos_count else group1_stats$phq9_pos_count
+  neg1 <- group1_stats$n_patients - pos1
+  pos2 <- if (phq_type == "PHQ-2") group2_stats$phq2_pos_count else group2_stats$phq9_pos_count
+  neg2 <- group2_stats$n_patients - pos2
+  mat <- matrix(c(pos1, neg1, pos2, neg2), nrow = 2, byrow = TRUE)
+  if(any(is.na(mat)) || any(mat < 0)) return(NA)
+  test_result <- tryCatch(chisq.test(mat, correct = TRUE), error = function(e) list(p.value = NA))
+  return(test_result$p.value)
+}
+
+significance_stars <- function(p) {
+  case_when(is.na(p) ~ "", p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "")
+}
+
+# --- Define Cohorts and Calculate Rates ---
+non_derm_cohort <- result_wide_all[!mrn_deid %in% unique(derm_clinic_cohort$mrn_deid)]
+
+stats_non_derm <- calculate_phq_positivity_dt(non_derm_cohort)
+stats_derm_clinic <- calculate_phq_positivity_dt(derm_clinic_cohort)
+stats_chronic_derm <- calculate_phq_positivity_dt(chronic_derm_cohort)
+
+plot_df <- data.frame(
+  Cohort = c("Chronic Derm", "Derm Clinic Cohort", "Non-Derm"),
+  N = c(stats_chronic_derm$n_patients, stats_derm_clinic$n_patients, stats_non_derm$n_patients),
+  PHQ2_Rate = c(stats_chronic_derm$phq2_pos_count / stats_chronic_derm$n_patients,
+                stats_derm_clinic$phq2_pos_count / stats_derm_clinic$n_patients,
+                stats_non_derm$phq2_pos_count / stats_non_derm$n_patients),
+  PHQ9_Rate = c(stats_chronic_derm$phq9_pos_count / stats_chronic_derm$n_patients,
+                stats_derm_clinic$phq9_pos_count / stats_derm_clinic$n_patients,
+                stats_non_derm$phq9_pos_count / stats_non_derm$n_patients)
+)
+
+plot_df$PHQ2_Rate_Formatted <- paste0(round(plot_df$PHQ2_Rate * 100, 1), "%")
+plot_df$PHQ9_Rate_Formatted <- paste0(round(plot_df$PHQ9_Rate * 100, 1), "%")
+
+plot_df$p_val_phq2 <- sapply(list(stats_chronic_derm, stats_derm_clinic, stats_non_derm), get_p_value, stats_non_derm, "PHQ-2")
+plot_df$p_val_phq9 <- sapply(list(stats_chronic_derm, stats_derm_clinic, stats_non_derm), get_p_value, stats_non_derm, "PHQ-9")
+
+plot_df$sig_phq2 <- significance_stars(plot_df$p_val_phq2)
+plot_df$sig_phq9 <- significance_stars(plot_df$p_val_phq9)
+
+# --- Generate Plots ---
+create_comparison_plot <- function(data, rate_col, sig_col, title) {
+  rate_col_sym <- sym(rate_col)
+  sig_col_sym <- sym(sig_col)
+  formatted_rate_col_sym <- sym(paste0(rate_col, "_Formatted"))
+
+  data$Cohort <- factor(data$Cohort, levels = c("Non-Derm", "Derm Clinic Cohort", "Chronic Derm"))
+
+  ggplot(data, aes(x = Cohort, y = !!rate_col_sym, fill = Cohort)) +
+    geom_bar(stat = "identity", color = "black", width = 0.7) +
+    geom_text(aes(label = !!formatted_rate_col_sym),
+              vjust = -0.5,
+              size = 5, fontface = "bold", color = "black") +
+    geom_text(aes(label = !!sig_col_sym, y = !!rate_col_sym + 0.03),
+              size = 8, color = "black") +
+    labs(title = title, subtitle = "Compared to Non-Dermatology Patients", x = NULL, y = "Positive Screening Rate") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.25))) +
+    scale_fill_manual(values = c("Chronic Derm" = "#D55E00", "Derm Clinic Cohort" = "#009E73", "Non-Derm" = "#56B4E9")) +
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+      plot.subtitle = element_text(hjust = 0.5, size = 14, color = "gray30"),
+      legend.position = "none",
+      axis.text.x = element_text(face = "bold", size = 14),
+      axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
+      plot.margin = margin(1, 1, 1, 1, "cm")
     )
+}
+
+plot_phq2 <- create_comparison_plot(plot_df, "PHQ2_Rate", "sig_phq2", "Comparison of PHQ-2 Positivity Rates Across Patient Cohorts")
+print(plot_phq2)
+
+plot_phq9 <- create_comparison_plot(plot_df, "PHQ9_Rate", "sig_phq9", "Comparison of PHQ-9 Positivity Rates Across Patient Cohorts")
+print(plot_phq9)
+```
+
+### Derm Conditions Screening Plots
+
+```{r}
+# --- Define Chronic Dermatological Conditions ---
+chronic_condition_terms <- list(
+  "Scarring Alopecia" = c("lichen planopilaris", "lichen plano-pilaris", "central centrifugal cicatricial alopecia", "cicatricial alopecia", "Alopecia, scarring", "Scarring alopecia"),
+  "Acne" = c("acne vulgaris", "other acne", "acne, unspecified acne type", "nodulocystic acne", "cystic acne", "acne keloidalis nuchae", "cystic acne vulgaris", "inflammatory acne"),
+  "Hidradenitis Suppurativa" = "hidradenitis suppurativa",
+  "Rosacea" = "rosacea",
+  "Vitiligo" = "vitiligo",
+  "Atopic Dermatitis" = c("intrinsic atopic dermatitis", "atopic dermatitis, unspecified type", "other atopic dermatitis", "atopic dermatitis"),
+  "Psoriasis" = "psoriasis",
+  "Lupus Erythematosus" = "lupus erythematosus",
+  "Alopecia Areata" = c("Alopecia areata", "Alopecia areata totalis")
+)
+
+# --- Create Cohorts, Calculate Rates and P-values ---
+non_chronic_cohort <- derm_clinic_cohort[!mrn_deid %in% unique(chronic_derm_cohort$mrn_deid)]
+
+stats_non_chronic <- calculate_phq_positivity_dt(non_chronic_cohort)
+
+plot_data_list <- lapply(names(chronic_condition_terms), function(name) {
+  terms <- chronic_condition_terms[[name]]
+  if (length(terms) > 1) {
+    mrns <- chronic_derm_cohort[tolower(icd_diagnosis) %in% tolower(terms), unique(mrn_deid)]
   } else {
-    counts_control <- data[is_chronic_derm == FALSE, .N, by = get(covariate_name)]
-    setnames(counts_control, c("Level", "N"))
-    counts_control[, Percentage := scales::percent(N / total_n_control, accuracy = 1)]
-    counts_control[, Display := paste0(N, " (", Percentage, ")")]
-    
-    counts_treated <- data[is_chronic_derm == TRUE, .N, by = get(covariate_name)]
-    setnames(counts_treated, c("Level", "N"))
-    counts_treated[, Percentage := scales::percent(N / total_n_treated, accuracy = 1)]
-    counts_treated[, Display := paste0(N, " (", Percentage, ")")]
-    
-    # Sort by chronic derm cohort (treated) sizes only in descending order
-    level_totals <- counts_treated[order(-N)]
-    
-    all_levels <- level_totals$Level
-    
-    merged_counts <- full_join(counts_control %>% select(Level, Control = Display), 
-                               counts_treated %>% select(Level, Treated = Display), 
-                               by = "Level")
-    
-    # order merged_counts by the level_totals order
-    merged_counts <- merged_counts[match(all_levels, merged_counts$Level), ]
-    merged_counts[is.na(merged_counts)] <- "0 (0.0%)"
-
-    # TRUE/FALSE to Yes/No for has_psych_condition
-    if (covariate_name == "has_psych_condition") {
-      merged_counts$Level <- recode(merged_counts$Level, `TRUE` = "Yes", `FALSE` = "No")
-    }
-
-    summary_list[[covariate_name]] <- data.frame(
-      Characteristic = covariate_name,
-      Level = merged_counts$Level,
-      Control = merged_counts$Control,
-      Treated = merged_counts$Treated,
-      stringsAsFactors = FALSE
-    )
+    mrns <- chronic_derm_cohort[str_detect(tolower(icd_diagnosis), tolower(terms)), unique(mrn_deid)]
   }
-  return(bind_rows(summary_list))
-}
-
-# make summaries for before vs after matching
-covariates_continuous <- c("age_at_encounter")
-covariates_categorical <- c("sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
-
-summary_before_list <- list()
-for (cov in covariates_continuous) {
-  summary_before_list[[cov]] <- summarize_covariate(patient_data_before, cov, is_continuous = TRUE)
-}
-for (cov in covariates_categorical) {
-  summary_before_list[[cov]] <- summarize_covariate(patient_data_before, cov, is_continuous = FALSE)
-}
-summary_before_df <- bind_rows(summary_before_list)
-
-summary_after_list <- list()
-for (cov in covariates_continuous) {
-  summary_after_list[[cov]] <- summarize_covariate(matched_data, cov, is_continuous = TRUE)
-}
-for (cov in covariates_categorical) {
-  summary_after_list[[cov]] <- summarize_covariate(matched_data, cov, is_continuous = FALSE)
-}
-summary_after_df <- bind_rows(summary_after_list)
-
-# combine and format for gt table
-setnames(summary_before_df, c("Control", "Treated"), c("Control_Before", "Treated_Before"))
-setnames(summary_after_df, c("Control", "Treated"), c("Control_After", "Treated_After"))
-
-final_table_data <- full_join(summary_before_df, summary_after_df, by = c("Characteristic", "Level"))
-
-characteristic_order <- c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class", "has_psych_condition")
-final_table_data$Characteristic <- factor(final_table_data$Characteristic, levels = characteristic_order)
-
-# Create a custom sorting function that preserves descending size order within each characteristic
-final_table_data <- final_table_data %>% 
-  arrange(Characteristic) %>%
-  group_by(Characteristic) %>%
-  mutate(row_order = row_number()) %>%
-  ungroup() %>%
-  arrange(Characteristic, row_order) %>%
-  select(-row_order)
-
-final_table_data$Characteristic <- recode(final_table_data$Characteristic,
-  age_at_encounter = "Age, mean (SD)",
-  sex = "Sex",
-  race_refined = "Race",
-  ethnic_refined = "Ethnicity",
-  fin_class = "Insurance Class",
-  has_psych_condition = "Prior Psych Care"
-)
-
-final_table_data <- final_table_data %>% 
-  mutate(Characteristic = as.character(Characteristic)) %>% 
-  group_by(Characteristic) %>% 
-  mutate(Characteristic_Display = ifelse(row_number() == 1, Characteristic, "")) %>% 
-  ungroup()
-
-library(MatchIt)
-
-# load the same matching data as file 4
-patient_data_df <- as.data.frame(patient_data_before)
-if (is.logical(patient_data_df$is_chronic_derm)) {
-  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
-} else {
-  patient_data_df$is_chronic_derm_numeric <- patient_data_df$is_chronic_derm
-}
-
-m_out <- matchit(
-  is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class + has_psych_condition,
-  data = patient_data_df,
-  method = "nearest",
-  distance = "glm",
-  caliper = 0.2,
-  replace = FALSE,
-  ratio = 20
-)
-
-balance_summary <- summary(m_out)
-
-# extract SMDs
-smd_before <- as.data.frame(balance_summary$sum.all) %>%
-  rownames_to_column("Covariate") %>%
-  select(Covariate, SMD_Before = `Std. Mean Diff.`)
-
-smd_after <- as.data.frame(balance_summary$sum.matched) %>%
-  rownames_to_column("Covariate") %>%
-  select(Covariate, SMD_After = `Std. Mean Diff.`)
-
-smd_table <- inner_join(smd_before, smd_after, by = "Covariate")
-smd_table$SMD_Before <- round(abs(smd_table$SMD_Before), 3)
-smd_table$SMD_After <- round(abs(smd_table$SMD_After), 3)
-
-# make mapping function to match MatchIt covariate names to table 
-map_covariate_to_table <- function(covariate_name) {
-  if (covariate_name == "age_at_encounter") {
-    return(list(char = "Age, mean (SD)", level = ""))
-  } else if (grepl("^sex", covariate_name)) {
-    level <- gsub("^sex", "", covariate_name)
-    return(list(char = "Sex", level = level))
-  } else if (grepl("^race_refined", covariate_name)) {
-    level <- gsub("^race_refined", "", covariate_name)
-    return(list(char = "Race", level = level))
-  } else if (grepl("^ethnic_refined", covariate_name)) {
-    level <- gsub("^ethnic_refined", "", covariate_name)
-    return(list(char = "Ethnicity", level = level))
-  } else if (grepl("^fin_class", covariate_name)) {
-    level <- gsub("^fin_class", "", covariate_name)
-    return(list(char = "Insurance Class", level = level))
-  } else if (grepl("^has_psych_condition", covariate_name)) {
-    level <- gsub("^has_psych_condition", "", covariate_name)
-    level <- ifelse(level == "TRUE", "Yes", ifelse(level == "FALSE", "No", level))
-    return(list(char = "Prior Psych Care", level = level))
-  }
-  return(NULL)
-}
-
-# add SMD columns to final table data
-final_table_data$SMD_Before <- ""
-final_table_data$SMD_After <- ""
-
-# map SMDs to all rows based on characteristic and level
-for (i in 1:nrow(final_table_data)) {
-  char <- final_table_data$Characteristic[i]
-  level <- final_table_data$Level[i]
+  cohort <- chronic_derm_cohort[mrn_deid %in% mrns]
+  stats <- calculate_phq_positivity_dt(cohort)
   
-  # find matching SMD entries
-  for (j in 1:nrow(smd_table)) {
-    mapping <- map_covariate_to_table(smd_table$Covariate[j])
-    if (!is.null(mapping) && mapping$char == char && mapping$level == level) {
-      final_table_data$SMD_Before[i] <- as.character(smd_table$SMD_Before[j])
-      final_table_data$SMD_After[i] <- as.character(smd_table$SMD_After[j])
-      break
-    }
-  }
+  if (stats$n_patients == 0) return(NULL)
+  
+  data.frame(
+    Cohort = name,
+    N = stats$n_patients,
+    PHQ2_Rate = stats$phq2_pos_count / stats$n_patients,
+    PHQ9_Rate = stats$phq9_pos_count / stats$n_patients,
+    p_val_phq2_vs_nc = get_p_value(stats, stats_non_chronic, "PHQ-2"),
+    p_val_phq9_vs_nc = get_p_value(stats, stats_non_chronic, "PHQ-9")
+  )
+})
+
+individual_rates_df <- bind_rows(plot_data_list)
+
+# --- Generate Plots ---
+create_plot <- function(data, rate_col, p_val_col, title, ref_line_rate) {
+  rate_col_sym <- sym(rate_col)
+  p_val_col_sym <- sym(p_val_col)
+  
+  data <- data %>% mutate(sig = significance_stars(!!p_val_col_sym))
+  
+  ggplot(data, aes(x = reorder(Cohort, !!rate_col_sym), y = !!rate_col_sym, fill = !!rate_col_sym)) +
+    geom_bar(stat = "identity", color = "black", width = 0.7) +
+    geom_text(aes(label = paste0(round(!!rate_col_sym * 100, 1), "%")), hjust = 1.2, size = 3.5, color = "white") +
+    geom_text(aes(label = sig), hjust = -0.3, size = 5, color = "black") +
+    geom_hline(aes(yintercept = ref_line_rate, linetype = "Non-Chronic Derm Rate"), color = "firebrick", size = 0.8) +
+    scale_fill_gradient(low = "#56B4E9", high = "#0072B2") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.15))) +
+    scale_linetype_manual(name = "", values = c("Non-Chronic Derm Rate" = "dashed")) +
+    coord_flip() +
+    labs(
+      title = title,
+      subtitle = "Compared to Non-Chronic Dermatology Patient Rate",
+      x = NULL, 
+      y = "Positive Screening Rate"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10),
+      axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+      legend.position = "bottom",
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.x = element_line(color = "gray90", linetype = "dotted"),
+      plot.margin = margin(1, 1, 1, 1, "cm")
+    ) +
+    guides(fill = "none")
 }
 
-#  gt table with SMDs
-table1_gt <- final_table_data %>% 
-  select(Characteristic_Display, Level, Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After) %>% 
-  gt() %>% 
-  cols_label(
-    Characteristic_Display = "Characteristic",
-    Level = "",
-    Control_Before = "Control",
-    Treated_Before = "Chronic Derm",
-    SMD_Before = "SMD",
-    Control_After = "Control", 
-    Treated_After = "Chronic Derm",
-    SMD_After = "SMD"
-  ) %>% 
-  tab_spanner(label = "Before Matching", columns = c(Control_Before, Treated_Before, SMD_Before)) %>% 
-  tab_spanner(label = "After Matching", columns = c(Control_After, Treated_After, SMD_After)) %>% 
-  tab_header(
-    title = "Table 1. Chronic Dermatology and Control Demographics Before and After Propensity Score Matching",
-    subtitle = "Values are n (%) unless otherwise specified. SMD = Standardized Mean Difference."
-  ) %>% 
-  #  styling for readability
-  tab_style(
-    style = cell_text(indent = px(20), size = px(13)),
-    locations = cells_body(columns = Level, rows = Level != "")
-  ) %>% 
-  tab_style(
-    style = cell_text(weight = "bold", size = px(14)),
-    locations = cells_body(columns = Characteristic_Display, rows = Characteristic_Display != "")
-  ) %>%
-  #  alternate row shading 
-  tab_style(
-    style = cell_fill(color = "#f8f9fa"),
-    locations = cells_body(rows = seq(2, nrow(final_table_data), 2))
-  ) %>%
-  # title and subtitle styling
-  tab_style(
-    style = list(
-      cell_text(size = px(16), weight = "bold", color = "#212529")
-    ),
-    locations = cells_title("title")
-  ) %>%
-  tab_style(
-    style = list(
-      cell_text(size = px(13), style = "italic", color = "#6c757d")
-    ),
-    locations = cells_title("subtitle")
-  ) %>%
-  cols_align(align = "left", columns = c(Characteristic_Display, Level)) %>% 
-  cols_align(align = "center", columns = c(Control_Before, Treated_Before, SMD_Before, Control_After, Treated_After, SMD_After)) %>% 
-  # enhanced table options
-  tab_options(
-    table.border.top.color = "#495057",
-    table.border.top.width = px(3),
-    table.border.bottom.color = "#495057",
-    table.border.bottom.width = px(2),
-    table.border.left.color = "#dee2e6",
-    table.border.left.width = px(1),
-    table.border.right.color = "#dee2e6",
-    table.border.right.width = px(1),
-    column_labels.font.weight = "bold",
-    column_labels.font.size = px(13),
-    table.font.size = px(13),
-    table.font.names = c("Calibri", "Segoe UI", "Helvetica", "Arial", "sans-serif"),
-    data_row.padding = px(8),
-    table.margin.left = px(0),
-    table.margin.right = px(0),
-    table.width = pct(100)
-  ) %>%
-  # enhanced footnote styling
-  tab_footnote(
-    footnote = "SMD <0.1 indicates good balance; SMD >0.1 indicates potential imbalance. SMD calculated as |mean_treated - mean_control| / pooled_SD for continuous variables, maximum category-specific SMD for categorical variables.",
-    locations = cells_column_labels(columns = SMD_Before)
-  ) %>%
-  tab_style(
-    style = cell_text(size = px(11), color = "#6c757d"),
-    locations = cells_footnotes()
-  ) %>%
-  # enhanced source note styling
-  tab_source_note(
-    source_note = "Propensity score matching performed using logistic regression with covariates: age, sex, race, ethnicity, insurance class, and prior psychiatric care."
-  ) %>%
-  tab_style(
-    style = cell_text(size = px(11), color = "#6c757d", style = "italic"),
-    locations = cells_source_notes()
-  )
+phq2_plot <- create_plot(individual_rates_df, "PHQ2_Rate", "p_val_phq2_vs_nc", "PHQ-2 Positivity by Chronic Condition", stats_non_chronic$phq2_pos_count / stats_non_chronic$n_patients)
+print(phq2_plot)
 
-print(table1_gt)
+phq9_plot <- create_plot(individual_rates_df, "PHQ9_Rate", "p_val_phq9_vs_nc", "PHQ-9 Positivity by Chronic Condition", stats_non_chronic$phq9_pos_count / stats_non_chronic$n_patients)
+print(phq9_plot)
+```
+
+### Significant Derm Conditions Plots
+```{r}
+# --- Filter for Significance ---
+significant_phq2 <- individual_rates_df %>%
+  filter(p_val_phq2_vs_nc < 0.05 & PHQ2_Rate > (stats_non_chronic$phq2_pos_count / stats_non_chronic$n_patients)) %>%
+  mutate(sig = significance_stars(p_val_phq2_vs_nc))
+
+significant_phq9 <- individual_rates_df %>%
+  filter(p_val_phq9_vs_nc < 0.05 & PHQ9_Rate > (stats_non_chronic$phq9_pos_count / stats_non_chronic$n_patients)) %>%
+  mutate(sig = significance_stars(p_val_phq9_vs_nc))
+
+# --- Generate Plots for Significant Conditions ---
+create_significant_plot <- function(data, rate_col, sig_col, title, ref_line_rate) {
+  rate_col_sym <- sym(rate_col)
+  sig_col_sym <- sym(sig_col)
+  
+  if (nrow(data) == 0) {
+    return(ggplot() + labs(title = title, subtitle = "No conditions with significantly higher rates found.") + theme_minimal())
+  }
+  
+  ggplot(data, aes(x = reorder(Cohort, !!rate_col_sym), y = !!rate_col_sym, fill = Cohort)) +
+    geom_bar(stat = "identity", color = "black", width = 0.7) +
+    geom_text(aes(label = paste0(round(!!rate_col_sym * 100, 1), "%")), hjust = 1.2, color = "white", size = 3.5) +
+    geom_text(aes(label = !!sig_col_sym), hjust = -0.3, size = 5, color = "black") +
+    geom_hline(aes(yintercept = ref_line_rate, linetype = "Non-Derm Rate"), color = "firebrick", size = 0.8) +
+    scale_fill_brewer(palette = "viridis") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.15))) +
+    scale_linetype_manual(name = "", values = c("Non-Derm Rate" = "dashed")) +
+    coord_flip() +
+    labs(
+      title = title,
+      subtitle = "Positivity rates significantly higher than the non-dermatology patient rate",
+      x = NULL, 
+      y = "Positive Screening Rate"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
+      axis.text = element_text(size = 10),
+      axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+      legend.position = "none",
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.x = element_line(color = "gray90", linetype = "dotted"),
+      plot.margin = margin(t = 1.5, r = 1, b = 1, l = 1, unit = "cm")
+    )
+}
+
+plot_sig_phq2 <- create_significant_plot(significant_phq2, "PHQ2_Rate", "sig", "Dermatologic Conditions with Significantly Higher PHQ-2 Positivity", stats_non_derm$phq2_pos_count / stats_non_derm$n_patients)
+print(plot_sig_phq2)
+
+plot_sig_phq9 <- create_significant_plot(significant_phq9, "PHQ9_Rate", "sig", "Dermatologic Conditions with Significantly Higher PHQ-9 Positivity", stats_non_derm$phq9_pos_count / stats_non_derm$n_patients)
+print(plot_sig_phq9)
 ```
 
 
+### ICD Counts Plot
 
+I would also like number of patients 
+
+```{r}
+# --- Load Data ---
+encounters_data <- fread(file.path(data_path, "specific_icd_encounters.csv"))
+
+# --- Prepare Data for Plotting ---
+plot_data <- encounters_data[, .N, by = icd_category]
+
+# --- Create the Bar Chart ---
+if (nrow(plot_data) > 0) {
+  icd_counts_plot <- ggplot(plot_data, aes(x = reorder(icd_category, N), y = N)) +
+    geom_bar(stat = "identity", fill = "#0072B2", width = 0.7) +
+    coord_flip() +
+    geom_text(aes(label = N), hjust = -0.2, size = 3.5, color = "black") +
+    labs(
+      title = "Encounter Counts for Specific Dermatological ICD-10 Codes",
+      subtitle = "Total number of encounters recorded for each condition category",
+      x = "ICD-10 Code Category",
+      y = "Number of Encounters"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+      axis.title.x = element_text(face = "bold"),
+      axis.title.y = element_text(face = "bold"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+
+  print(icd_counts_plot)
+}
+```
+
+### Sankey Plot
+
+```{r}
+# --- Load Data ---
+patient_summary <- fread(file.path(data_path, "longitudinal_patient_phq_change.csv"))
+
+# --- Prepare Data for the Sankey Diagram ---
+links <- patient_summary %>%
+  group_by(ever_positive_pre, ever_positive_post) %>%
+  summarise(value = n(), .groups = 'drop') %>%
+  as.data.table()
+
+nodes <- data.frame(name = c(
+  "Pre-Chronic Negative", 
+  "Pre-Chronic Positive", 
+  "Post-Chronic Negative", 
+  "Post-Chronic Positive"
+))
+
+links$source <- ifelse(links$ever_positive_pre == FALSE, 0, 1)
+links$target <- ifelse(links$ever_positive_post == FALSE, 2, 3)
+
+# --- Create the Sankey Diagram ---
+my_color <- 'd3.scaleOrdinal().domain(["Pre-Chronic Negative", "Pre-Chronic Positive", "Post-Chronic Negative", "Post-Chronic Positive"]).range(["#0072B2", "#D55E00", "#0072B2", "#D55E00"])'
+
+sankey_plot <- sankeyNetwork(
+  Links = links,
+  Nodes = nodes,
+  Source = "source",
+  Target = "target",
+  Value = "value",
+  NodeID = "name",
+  units = "Patients",
+  fontSize = 14,
+  nodeWidth = 30,
+  colourScale = my_color
+)
+
+sankey_plot <- htmlwidgets::prependContent(
+  sankey_plot, 
+  htmltools::tags$h2(
+    style = "font-family: Arial, sans-serif; text-align: center;", 
+    "Change in Patient PHQ-2 Status After Chronic Derm Diagnosis"
+  )
+)
+
+print(sankey_plot)
+```
