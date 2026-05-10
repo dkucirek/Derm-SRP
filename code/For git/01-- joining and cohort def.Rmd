@@ -38,6 +38,12 @@ encounters_data <- fread(
 )[age_at_encounter >= 18]
 
 setnames(encounters_data, tolower(names(encounters_data)))
+cat("Encounter date range:", 
+    as.character(min(encounters_data$enc_date, na.rm=TRUE)), 
+    "to", 
+    as.character(max(encounters_data$enc_date, na.rm=TRUE)), "\n")
+cat("Encounters before 2022:", sum(encounters_data$enc_date < as.Date("2022-01-01"), na.rm=TRUE), "\n")
+cat("Encounters after 2025:", sum(encounters_data$enc_date > as.Date("2025-12-31"), na.rm=TRUE), "\n")
 ```
 
 ### Data Cleaning and Merging
@@ -434,13 +440,19 @@ cat("3. Chronic derm patients with PHQ data (unique):", uniqueN(chronic_derm_coh
 cat("4. Chronic derm encounters with PHQ data:", nrow(chronic_derm_cohort), "\n")
 cat("   NOTE: Chronic derm cohort now ONLY includes patients with available PHQ scores\n")
 
-# PHQ data availability in chronic derm cohort
-chronic_derm_phq_summary <- chronic_derm_cohort[, .(
+chronic_derm_phq_summary <- chronic_derm_master[, .(
   has_any_phq = any(!is.na(phq_score)),
   has_phq9 = any(phq_type_used == "PHQ9", na.rm = TRUE),
   has_phq2_only = any(phq_type_used == "PHQ2", na.rm = TRUE) & !any(phq_type_used == "PHQ9", na.rm = TRUE),
-  worst_severity = phq_severity[which.max(ifelse(is.na(phq_score), -1, phq_score))]
+  max_phq_score = if (any(!is.na(phq_score))) max(phq_score, na.rm = TRUE) else NA_real_
 ), by = mrn_deid]
+
+# Compute worst_severity from max_phq_score (avoids stale phq_severity lookup)
+chronic_derm_phq_summary[, worst_severity := fifelse(is.na(max_phq_score), "Missing",
+                                            fifelse(max_phq_score <= 4, "Negative",
+                                            fifelse(max_phq_score <= 9, "Mild",
+                                            fifelse(max_phq_score <= 14, "Moderate",
+                                            fifelse(max_phq_score <= 19, "Moderately Severe", "Severe")))))]
 
 cat("\n=== CHRONIC DERM COHORT PHQ DATA ===\n")
 cat("Chronic derm patients with any PHQ data:", sum(chronic_derm_phq_summary$has_any_phq), "(100% by inclusion criteria)\n")
@@ -532,4 +544,11 @@ cat("  chronic_derm_patient_summary.rds - patient-level summary with all conditi
 cat("  chronic_derm_patient_conditions.rds - condition-to-patient mapping\n")
 cat("  condition_patient_counts.rds - verified patient counts per condition\n")
 cat("  patient_data_for_matching.rds - patient demographics for matching/analysis\n")
+
+# Multi-condition patient count (manuscript Results claim: n=79, 1.7%)
+condition_cols <- grep("^condition_", names(chronic_derm_patient_summary), value = TRUE)
+n_conditions_per_patient <- rowSums(chronic_derm_patient_summary[, ..condition_cols])
+cat("Patients with exactly 1 chronic derm condition:", sum(n_conditions_per_patient == 1), "\n")
+cat("Patients with >1 chronic derm condition:", sum(n_conditions_per_patient > 1), 
+    "(", round(100 * sum(n_conditions_per_patient > 1) / nrow(chronic_derm_patient_summary), 1), "%)\n")
 ```
