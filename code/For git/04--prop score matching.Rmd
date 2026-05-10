@@ -1,134 +1,83 @@
 ---
-title: "04: Propensity Score Matching"
+title: "04: Combined Cohort Analysis"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-### Load Libraries and Data
+## Load Libraries and Data
 
-```{r}
+```{r load_data}
 library(data.table)
-library(dplyr)
-library(lme4)
-library(stringr)
 library(MatchIt)
-library(ggplot2) #for plotting
-library(gt) # for table formatting
-library(scales) # for percentage formatting
-library(tibble) # rownames_to_column
-library(tidyr) # for full_join
-library(magrittr) # for %>%
-library(htmlwidgets) # for saving gt tables as HTML
-library(epitools) # for oddsratio function
+library(gt)
+library(sandwich)
+library(lmtest)
+library(stringr)
 
 data_path <- "Z:/Kucirek/"
+output_path <- "C:/Users/dkucirek/Documents/Derm-SRP/"
+tables_dir <- file.path(output_path, "tables")
+csv_dir <- file.path(output_path, "csv")
 
-#output paths
-output_base_path <- "C:/Users/dkucirek/Documents/Derm-SRP/"
-tables_output_path <- file.path(output_base_path, "tables")
-figures_output_path <- file.path(output_base_path, "figures")
+if (!dir.exists(tables_dir)) dir.create(tables_dir, recursive = TRUE)
+if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
 
-# output directories if they don't exist
-if (!dir.exists(tables_output_path)) {
-  dir.create(tables_output_path, recursive = TRUE)
-}
-if (!dir.exists(figures_output_path)) {
-  dir.create(figures_output_path, recursive = TRUE)
-}
-
-# reusable function for gt table from a 2x2 matrix
-create_comparison_table <- function(matrix, title, subtitle) {
-  or_result <- epitools::oddsratio(matrix)
-  chisq_result <- chisq.test(matrix)
-
-  df <- as.data.frame.matrix(matrix)
-  df <- tibble::rownames_to_column(df, "Group")
-  df$Total <- rowSums(matrix)
-  df$Proportion <- df$Positive / df$Total
-
-  gt(df) %>%
-    cols_label(
-      Group = "Cohort",
-      Positive = "Positive",
-      Negative = "Negative",
-      Total = "Total Patients",
-      Proportion = "Positivity Rate"
-    ) %>%
-    fmt_percent(columns = Proportion, decimals = 1) %>%
-    tab_header(title = title, subtitle = subtitle) %>%
-    tab_source_note(
-      source_note = paste0(
-        "Odds Ratio: ", round(or_result$measure[2, 1], 2),
-        " (95% CI: ", round(or_result$measure[2, 2], 2), " - ", round(or_result$measure[2, 3], 2), ")",
-        " | Chi-squared p-value: ", scales::pvalue(chisq_result$p.value)
-      )
-    ) %>%
-    tab_options(
-      table.border.top.color = "#D3D3D3",
-      table.border.bottom.color = "#D3D3D3",
-      column_labels.font.weight = "bold"
-    )
+format_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
 }
 
+result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
+patient_data <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
 
-# load pre-processed Data
-result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
-chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
-result_info <- readRDS(file.path(data_path, "result_info.rds"))
-
-setDT(result_wide_all)
-setDT(chronic_derm_cohort)
-setDT(result_info)
-
-#  verify cohort size 
-cat("=== DATA VALIDATION ===\n")
-cat("Chronic dermatology cohort encounters:", nrow(chronic_derm_cohort), "\n")
-cat("Chronic dermatology unique patients:", n_distinct(chronic_derm_cohort$mrn_deid), "\n")
-cat("Total encounters in result_wide_all:", nrow(result_wide_all), "\n")
-cat("Total unique patients in result_wide_all:", n_distinct(result_wide_all$mrn_deid), "\n")
-
-# verify using correct chronic derm cohort (should be ~4000-4600 PATIENTS)
-unique_chronic_derm_patients <- n_distinct(chronic_derm_cohort$mrn_deid)
-if (unique_chronic_derm_patients < 3000) {
-  warning("WARNING: Chronic dermatology patient count appears smaller than expected. Verify you're not using washout data.")
-}
-if (unique_chronic_derm_patients >= 4000 && unique_chronic_derm_patients <= 5000) {
-  cat("✓ Chronic dermatology patient count appears correct for main analysis\n")
-} else if (unique_chronic_derm_patients > 6000) {
-  warning("WARNING: Chronic dermatology patient count appears higher than expected. This might include encounters rather than unique patients.")
-}
-
-cat("========================\n\n")
+setDT(result_wide)
+setDT(patient_data)
 ```
 
-### Propensity Score Matching
+## Prep: Build Columns Expected by Downstream Analysis
 
-```{r}
-#load data
-patient_data_for_matching <- readRDS(file.path(data_path, "patient_data_for_matching.rds"))
-setDT(patient_data_for_matching)
+```{r prep}
+# Encounter-level any-clinical-depression flag (PHQ-9 >= 10).
+# Severity strata (mild/moderate/mod-severe/severe) are NOT created at encounter
+# level — they get assigned at patient level in the outcomes chunk based on
+# each patient's worst score (per Methods).
+result_wide[, phq_any_clinical_depression := !is.na(phq_score) & phq_score >= 10]
 
-# estimate prop scores
-patient_data_df <- as.data.frame(patient_data_for_matching)
-
-
-if (is.logical(patient_data_df$is_chronic_derm)) {
-  patient_data_df$is_chronic_derm_numeric <- as.numeric(patient_data_df$is_chronic_derm)
+# Suicidal ideation from PHQ-9 Item 9 (>= 1 = endorsed)
+si_col <- grep("thoughts.*dead|thoughts.*hurting", names(result_wide),
+               value = TRUE, ignore.case = TRUE)
+if (length(si_col) > 0) {
+  result_wide[, phq_si := !is.na(get(si_col[1])) & as.numeric(get(si_col[1])) >= 1]
 } else {
-  patient_data_df$is_chronic_derm_numeric <- patient_data_df$is_chronic_derm
+  result_wide[, phq_si := FALSE]
+  warning("No SI column found")
 }
 
-# perform matching
-matching_formula <- as.formula(
-  is_chronic_derm_numeric ~ age_at_encounter + sex + race_refined + ethnic_refined + fin_class + has_psych_condition
-)
+cat("Prep complete\n")
+cat("  phq_si:", sum(result_wide$phq_si, na.rm = TRUE), "\n")
+cat("  Race/ethnicity by group:\n")
+print(table(patient_data$race_ethnicity_combined, patient_data$is_chronic_derm))
+
+cat("\nData loaded\n")
+cat("Chronic derm:", sum(patient_data$is_chronic_derm), "\n")
+cat("Controls:", sum(!patient_data$is_chronic_derm), "\n")
+```
+
+## Propensity Score Matching
+
+```{r matching}
+set.seed(42)
+
+match_df <- as.data.frame(patient_data)
+match_df$treat <- as.numeric(match_df$is_chronic_derm)
 
 m_out <- matchit(
-  matching_formula,
-  data = patient_data_df,
+  treat ~ age_at_encounter + sex + race_ethnicity_combined + fin_class + has_psych_condition,
+  data = match_df,
   method = "nearest",
   distance = "glm",
   caliper = 0.2,
@@ -136,409 +85,489 @@ m_out <- matchit(
   ratio = 20
 )
 
-#extract and save matched data
 matched_data <- match.data(m_out)
-
-# make sure 'treat' column is correctly populated
-matched_data$treat <- m_out$treat[as.numeric(row.names(matched_data))]
-
 setDT(matched_data)
 
-output_matched_data_rds <- file.path(data_path, "matched_patient_data.rds")
-saveRDS(matched_data, output_matched_data_rds)
+matched_data[, is_chronic_derm := treat == 1]
 
-summary(m_out)
+cat("\n=== Matching Results ===\n")
+cat("Chronic derm:", sum(matched_data$is_chronic_derm), "\n")
+cat("Controls:", sum(!matched_data$is_chronic_derm), "\n")
+
+bal <- summary(m_out)$sum.matched[, "Std. Mean Diff."]
+cat("Max SMD:", round(max(abs(bal)), 3), "\n")
+cat("Per-variable SMDs (matched cohort):\n")
+print(round(bal, 4))
+
+# Save SMDs to CSV for reproducibility
+fwrite(data.table(Variable = names(bal), SMD = round(as.numeric(bal), 4)),
+       file.path(csv_dir, "Per_Variable_SMDs.csv"))
+
+saveRDS(matched_data, file.path(data_path, "matched_data.rds"))
 ```
 
-### Analysis of Unmatched Chronic Dermatology Patients
+## Patient-Level Outcomes
 
-```{r}
-# analyze unmatched chronic dermatology patients
-unmatched_treated_indices <- which(m_out$treat == 1 & m_out$weights == 0)
-matched_treated_indices <- which(m_out$treat == 1 & m_out$weights > 0)
-
-if(length(unmatched_treated_indices) > 0) {
-  
-  # get characteristics of unmatched chronic derm patients
-  unmatched_characteristics <- patient_data_df[unmatched_treated_indices, ]
-  matched_characteristics <- patient_data_df[matched_treated_indices, ]
-  
-  cat("=== ANALYSIS OF", length(unmatched_treated_indices), "UNMATCHED CHRONIC DERM PATIENTS ===\n\n")
-  
-  # propensity scores
-  cat("Propensity Score Analysis:\n")
-  cat("Unmatched patients - Mean:", round(mean(m_out$distance[unmatched_treated_indices]), 3), 
-      ", Range:", round(min(m_out$distance[unmatched_treated_indices]), 3), 
-      "to", round(max(m_out$distance[unmatched_treated_indices]), 3), "\n")
-  cat("Matched patients - Mean:", round(mean(m_out$distance[matched_treated_indices]), 3), 
-      ", Range:", round(min(m_out$distance[matched_treated_indices]), 3), 
-      "to", round(max(m_out$distance[matched_treated_indices]), 3), "\n\n")
-  
-  # age comparison
-  cat("Age Analysis:\n")
-  cat("Unmatched patients - Mean age:", round(mean(unmatched_characteristics$age_at_encounter), 1), 
-      ", Range:", round(min(unmatched_characteristics$age_at_encounter)), 
-      "to", round(max(unmatched_characteristics$age_at_encounter)), "\n")
-  cat("Matched patients - Mean age:", round(mean(matched_characteristics$age_at_encounter), 1), "\n\n")
-  
-  # detailed characteristics of each unmatched patient
-  cat("Individual Patient Characteristics:\n")
-  for(i in 1:length(unmatched_treated_indices)) {
-    idx <- unmatched_treated_indices[i]
-    patient <- patient_data_df[idx, ]
-    cat("Patient", i, ":")
-    cat(" Age =", patient$age_at_encounter)
-    cat(", Sex =", patient$sex)
-    cat(", Race =", patient$race_refined)
-    cat(", Insurance =", patient$fin_class)
-    cat(", Psych =", patient$has_psych_condition)
-    cat(", PropScore =", round(m_out$distance[idx], 3), "\n")
-  }
-  
-  cat("\n=== SUMMARY STATISTICS ===\n")
-  
-  # compare distributions
-  cat("Sex distribution (unmatched):\n")
-  print(table(unmatched_characteristics$sex))
-  
-  cat("\nRace distribution (unmatched):\n")
-  print(table(unmatched_characteristics$race_refined))
-  
-  cat("\nInsurance distribution (unmatched):\n")
-  print(table(unmatched_characteristics$fin_class))
-  
-  cat("\nPrior psych condition (unmatched):\n")
-  print(table(unmatched_characteristics$has_psych_condition))
-  
-  # look for patients with propensity scores above caliper threshold
-  high_prop_patients <- sum(m_out$distance[unmatched_treated_indices] > 0.2)
-  cat("\nPatients with propensity score > 0.2 (caliper threshold):", high_prop_patients, "out of", length(unmatched_treated_indices), "\n")
-  
-  # summary table for unmatched patients
-  unmatched_summary_df <- data.frame(
-    Patient_ID = 1:length(unmatched_treated_indices),
-    Age = unmatched_characteristics$age_at_encounter,
-    Sex = unmatched_characteristics$sex,
-    Race = unmatched_characteristics$race_refined,
-    Insurance = unmatched_characteristics$fin_class,
-    Prior_Psych = unmatched_characteristics$has_psych_condition,
-    Propensity_Score = round(m_out$distance[unmatched_treated_indices], 3)
-  )
-  
-  #  gt table for unmatched patients
-  unmatched_gt <- unmatched_summary_df %>%
-    gt() %>%
-    tab_header(
-      title = "Characteristics of Unmatched Chronic Dermatology Patients",
-      subtitle = paste("All", nrow(unmatched_summary_df), "patients that could not be matched")
-    ) %>%
-    cols_label(
-      Patient_ID = "Patient #",
-      Age = "Age",
-      Sex = "Sex",
-      Race = "Race",
-      Insurance = "Insurance",
-      Prior_Psych = "Prior Psych",
-      Propensity_Score = "Prop Score"
-    ) %>%
-    fmt_number(columns = Propensity_Score, decimals = 3) %>%
-    tab_style(
-      style = cell_fill(color = "#ffcccc"),
-      locations = cells_body(columns = Propensity_Score, rows = Propensity_Score > 0.2)
-    ) %>%
-    tab_footnote(
-      footnote = "Red highlighted propensity scores are above the 0.2 caliper threshold",
-      locations = cells_column_labels(columns = Propensity_Score)
-    ) %>%
-    tab_options(
-      table.border.top.color = "#D3D3D3",
-      table.border.bottom.color = "#D3D3D3",
-      column_labels.font.weight = "bold"
-    )
-  
-  gtsave(unmatched_gt, filename = "table_unmatched_patients_modeling.html", path = tables_output_path)
-  print(unmatched_gt)
-  
-} else {
-  cat("No unmatched chronic dermatology patients found.\n")
-}
-```
-
-### Table 1a: Propensity Score Matching Balance
-
-```{r}
-# get balance summary from m_out
-balance_summary <- summary(m_out)
-
-# make balance table by combining before and after summaries.
-smd_before <- as.data.frame(balance_summary$sum.all) %>%
-  rownames_to_column("Covariate") %>%
-  select(Covariate, `Std. Mean Diff. (Before)` = `Std. Mean Diff.`)
-
-smd_after <- as.data.frame(balance_summary$sum.matched) %>%
-  rownames_to_column("Covariate") %>%
-  select(Covariate, `Std. Mean Diff. (After)` = `Std. Mean Diff.`)
-
-# join tables by the covariate names
-smd_table <- dplyr::inner_join(smd_before, smd_after, by = "Covariate")
-
-# recode covariate names for presentation
-smd_table <- smd_table %>%
-  mutate(Covariate = recode(Covariate,
-    `distance` = "Propensity Score",
-    `age_at_encounter` = "Age at Encounter",
-    `sexFemale` = "Sex: Female",
-    `sexMale` = "Sex: Male",
-    `sexUnknown` = "Sex: Unknown",
-    `race_refinedAmerican Indian / Alaska Native` = "Race: American Indian / Alaska Native",
-    `race_refinedBlack or African American` = "Race: Black or African American",
-    `race_refinedDeclined / Unknown` = "Race: Declined / Unknown",
-    `race_refinedEast/Other Asian` = "Race: East/Other Asian",
-    `race_refinedMore than one Race` = "Race: More than one Race",
-    `race_refinedNative Hawaiian / Pacific Islander` = "Race: Native Hawaiian / Pacific Islander",
-    `race_refinedOther` = "Race: Other",
-    `race_refinedSouth Asian` = "Race: South Asian",
-    `race_refinedWhite` = "Race: White",
-    `ethnic_refinedMexican / Chicano` = "Ethnicity: Mexican / Chicano",
-    `ethnic_refinedNot Hispanic / Latino` = "Ethnicity: Not Hispanic / Latino",
-    `ethnic_refinedOther Hispanic / Latino` = "Ethnicity: Other Hispanic / Latino",
-    `ethnic_refinedPatient Declined` = "Ethnicity: Patient Declined",
-    `ethnic_refinedUnknown / Other` = "Ethnicity: Unknown / Other",
-    `fin_classBlue Cross/Blue Shield` = "Insurance: Blue Cross/Blue Shield",
-    `fin_classMedicaid` = "Insurance: Medicaid",
-    `fin_classMedicare` = "Insurance: Medicare",
-    `fin_classOther` = "Insurance: Other",
-    `fin_classPrivate Payors` = "Insurance: Private Payors",
-    `fin_classSelf-Pay` = "Insurance: Self-Pay",
-    `has_psych_conditionFALSE` = "Prior Psych Care: No",
-    `has_psych_conditionTRUE` = "Prior Psych Care: Yes"
-  ))
-
-# print  table using gt for better look
-gt_smd_table <- smd_table %>%
-  gt() %>%
-  tab_header(
-    title = "Standardized Mean Differences Before and After Matching",
-    subtitle = "Absolute values of standardized mean differences for covariates"
-  ) %>%
-  fmt_number(columns = c(`Std. Mean Diff. (Before)`, `Std. Mean Diff. (After)`), decimals = 3) %>%
-  cols_align(align = "left", columns = Covariate) %>%
-  cols_align(align = "center", columns = c(`Std. Mean Diff. (Before)`, `Std. Mean Diff. (After)`)) %>%
-  tab_options(
-    table.border.top.color = "#D3D3D3",
-    table.border.bottom.color = "#D3D3D3",
-    column_labels.font.weight = "bold"
-  )
-gtsave(gt_smd_table, filename = "table1a_propensity_score_balance_modeling.html", path = tables_output_path)
-
-print(gt_smd_table)
-```
-
-### Propensity Score Distribution Plots
-
-```{r}
-# get propensity scores and treatment status before matching
-if (!is.null(m_out) && length(m_out$distance) > 0) {
-  prop_scores_before <- data.frame(
-    prop_score = m_out$distance,
-    group = ifelse(m_out$treat == 1, "Chronic Derm", "Control"),
-    matching_status = "Before Matching"
-  )
-} else {
-  prop_scores_before <- data.frame(
-    prop_score = numeric(0),
-    group = character(0),
-    matching_status = character(0)
-  )
-  message("m_out is empty or has no distance/treat data. Propensity score 'Before Matching' data will be empty.")
-}
-
-# plot_data_prop_scores with 'Before Matching' data
-plot_data_prop_scores <- prop_scores_before
-
-# Conditionally add 'After Matching' data if matches were found
-if (!is.null(matched_data) && nrow(matched_data) > 0) {
-  prop_scores_after <- data.frame(
-    prop_score = matched_data$distance,
-    group = ifelse(matched_data$treat == 1, "Chronic Derm", "Control"),
-    matching_status = "After Matching"
-  )
-  plot_data_prop_scores <- bind_rows(plot_data_prop_scores, prop_scores_after)
-} else {
-  message("No matches found. Propensity score distribution plot will only show 'Before Matching' data.")
-}
-
-# set factor levels based on what's actually present in the data
-actual_levels <- unique(plot_data_prop_scores$matching_status)
-plot_data_prop_scores$matching_status <- factor(plot_data_prop_scores$matching_status, 
-                                                levels = c("Before Matching", "After Matching")[c("Before Matching", "After Matching") %in% actual_levels])
-
-# make density plot
-if (nrow(plot_data_prop_scores) > 0) {
-  propensity_plot <- ggplot(plot_data_prop_scores, aes(x = prop_score, fill = group, color = group)) +
-    geom_density(alpha = 0.5) +
-    facet_wrap(~ matching_status, scales = "free_y") +
-    labs(title = "Propensity Score Distribution",
-         subtitle = "Distribution of propensity scores before and after matching",
-         x = "Propensity Score",
-         y = "Density",
-         fill = "Group",
-         color = "Group") +
-    scale_fill_manual(values = c("Chronic Derm" = "#E69F00", "Control" = "#56B4E9")) + # Orange and Blue
-    scale_color_manual(values = c("Chronic Derm" = "#E69F00", "Control" = "#56B4E9")) + # Orange and Blue
-    coord_cartesian(xlim = c(0, 0.2)) + # Zoom in on the x-axis to see the area of overlap more clearly
-    theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
-          plot.subtitle = element_text(hjust = 0.5))
-
-  # save  plot
-  ggsave(propensity_plot, filename = "propensity_score_distribution.png", path = figures_output_path, width = 12, height = 6)
-} else {
-  message("No data available for propensity score distribution plot in 04_modeling.Rmd. Skipping plot generation.")
-}
-
-print(propensity_plot)
-```
-
-```{r}
-#ID patients with high prop scores 
-# create df to analyze which patients are outside plot's x-axis limit.
-plot_analysis_df <- data.frame(
-  mrn_deid = patient_data_df$mrn_deid,
-  prop_score = m_out$distance,
-  is_matched = ifelse(m_out$weights > 0, TRUE, FALSE),
-  is_treated = m_out$treat == 1
-)
-
-# patients with a propensity score > 0.2
-cutoff_patients <- plot_analysis_df %>%
-  filter(prop_score > 0.2)
-
-# characteristics of cutoff patients
-cat("Summary of patients with propensity scores > 0.2 (visually excluded from the plot's main view):\n")
-
-cutoff_summary <- cutoff_patients %>%
-  group_by(is_treated, is_matched) %>%
-  summarise(count = n(), .groups = 'drop') %>%
-  mutate(
-    Group = ifelse(is_treated, "Chronic Derm", "Control"),
-    `Matching Status` = ifelse(is_matched, "Matched", "Unmatched")
-  )
-
-# Display the summary in a clean table
-cutoff_summary_table <- cutoff_summary[, c("Group", "Matching Status", "count")]
-
-# Use gt for a clean presentation
-if (nrow(cutoff_summary_table) > 0) {
-  cutoff_gt <- gt(cutoff_summary_table) %>%
-    tab_header(title = "Patients with Propensity Score > 0.2") %>%
-    cols_label(count = "Number of Patients") %>%
-    tab_options(
-      table.border.top.color = "#D3D3D3",
-      table.border.bottom.color = "#D3D3D3",
-      column_labels.font.weight = "bold"
-    )
-  gtsave(cutoff_gt, filename = "table_cutoff_patients_modeling.html", path = tables_output_path)
-  print(cutoff_gt)
-} else {
-  cat("No patients found with a propensity score greater than 0.2.\n")
-}
-
-cat("\nThis summary confirms that the patients in the 'tail' of the distribution are part of the unmatched control group.\n")
-```
-
-### Propensity Score Matching Analysis
-
-```{r}
-matched_data <- readRDS(file.path(data_path, "matched_patient_data.rds"))
-setDT(matched_data)
-
-#prep data for analysis
+```{r outcomes}
 matched_mrns <- unique(matched_data$mrn_deid)
-outcome_data <- result_wide_all[mrn_deid %in% matched_mrns]
 
-outcome_data <- merge(outcome_data, matched_data[, .(mrn_deid, is_chronic_derm)], by = "mrn_deid", all.x = TRUE)
+phq_data <- result_wide[mrn_deid %in% matched_mrns]
+phq_data <- merge(phq_data, matched_data[, .(mrn_deid, is_chronic_derm)], by = "mrn_deid")
 
-# handle different possible column names for PHQ-2
-phq2_col_names <- c("phq_value_CMS_PHQ.2_POS.NEG", "phq_value_CMS PHQ-2 POS/NEG", "phq_value_CMS.PHQ.2.POS.NEG")
-phq2_col <- NULL
-for (col in phq2_col_names) {
-  if (col %in% names(outcome_data)) {
-    phq2_col <- col
-    break
-  }
-}
-
-# replace the fcase with basic assignment
-outcome_data[, phq2_positive := FALSE]  # Start with all FALSE
-
-if (!is.null(phq2_col)) {
-  outcome_data[get(phq2_col) == "Positive", phq2_positive := TRUE]
-}
-
-if ("phq2_manual_posneg" %in% names(outcome_data)) {
-  outcome_data[phq2_manual_posneg == "Positive", phq2_positive := TRUE]
-}
-
-patient_phq_status <- outcome_data[, .(
-  ever_phq2_positive = any(phq2_positive, na.rm = TRUE)
+# Patient-level aggregation — keep max score, any-clinical-depression, and SI
+patient_outcomes <- phq_data[, .(
+  max_phq                 = max(phq_score, na.rm = TRUE),
+  any_clinical_depression = any(phq_any_clinical_depression, na.rm = TRUE),
+  si                      = any(phq_si, na.rm = TRUE)
 ), by = .(mrn_deid, is_chronic_derm)]
 
-# compare PHQ-2 positivity
-# logicals to factors to ensure table has correct dimensions and labels
-patient_phq_status$ever_phq2_positive_factor <- factor(patient_phq_status$ever_phq2_positive, 
-                                                       levels = c(TRUE, FALSE), 
-                                                       labels = c("Positive", "Negative"))
-patient_phq_status$is_chronic_derm_factor <- factor(patient_phq_status$is_chronic_derm, 
-                                                    levels = c(TRUE, FALSE), 
-                                                    labels = c("Chronic Derm", "Control"))
+patient_outcomes[is.infinite(max_phq), max_phq := NA]
 
-phq2_contingency_table <- table(
-  Chronic_Derm_Status = patient_phq_status$is_chronic_derm_factor,
-  PHQ2_Positive = patient_phq_status$ever_phq2_positive_factor
-)
+# Assign mutually exclusive severity strata based on each patient's WORST PHQ score
+# (per Methods: "the highest recorded PHQ score was used to describe their symptom severity")
+patient_outcomes[, `:=`(
+  mild       = !is.na(max_phq) & max_phq >= 5  & max_phq < 10,
+  moderate   = !is.na(max_phq) & max_phq >= 10 & max_phq < 15,
+  mod_severe = !is.na(max_phq) & max_phq >= 15 & max_phq < 20,
+  severe     = !is.na(max_phq) & max_phq >= 20
+)]
 
-print(create_comparison_table(phq2_contingency_table, "PHQ-2 Positivity in Matched Cohort", "Chronic Derm vs. Control"))
-
-#PHQ-9 analysis, matched
-
-# add PHQ-9 positivity column 
-outcome_data[, phq9_positive := FALSE]  # Start with all FALSE
-
-# check for PHQ-9 POS/NEG column
-phq9_col_names <- c("phq_value_CMS_PHQ.9_POS.NEG", "phq_value_CMS PHQ-9 POS/NEG", "phq_value_CMS.PHQ.9.POS.NEG")
-phq9_col <- NULL
-for (col in phq9_col_names) {
-  if (col %in% names(outcome_data)) {
-    phq9_col <- col
-    break
-  }
-}
-
-if (!is.null(phq9_col)) {
-  outcome_data[get(phq9_col) == "Positive", phq9_positive := TRUE]
-}
-
-if ("phq9_manual_sum" %in% names(outcome_data)) {
-  outcome_data[!is.na(phq9_manual_sum) & phq9_manual_sum >= 10, phq9_positive := TRUE]
-}
-
-# PHQ-9 analysis
-patient_phq9_status <- outcome_data[, .(
-  ever_phq9_positive = any(phq9_positive, na.rm = TRUE)
-), by = .(mrn_deid, is_chronic_derm)]
-
-# logicals to factors for the comparison function
-patient_phq9_status$ever_phq9_positive_factor <- factor(patient_phq9_status$ever_phq9_positive, levels = c(TRUE, FALSE), labels = c("Positive", "Negative"))
-patient_phq9_status$is_chronic_derm_factor <- factor(patient_phq9_status$is_chronic_derm, levels = c(TRUE, FALSE), labels = c("Chronic Derm", "Control"))
-
-phq9_contingency_table <- table(
-  Chronic_Derm_Status = patient_phq9_status$is_chronic_derm_factor,
-  PHQ9_Positive = patient_phq9_status$ever_phq9_positive_factor
-)
-
-cat("PHQ-9 Results for Matched Cohort:\n")
-print(create_comparison_table(phq9_contingency_table, "PHQ-9 Positivity in Matched Cohort", "Chronic Derm vs. Control"))
+cat("\nPatients with outcomes:", nrow(patient_outcomes), "\n")
+cat("\nSeverity breakdown by group (sanity check):\n")
+print(patient_outcomes[, .(
+  mild         = sum(mild),
+  moderate     = sum(moderate),
+  mod_severe   = sum(mod_severe),
+  severe       = sum(severe),
+  any_clinical = sum(any_clinical_depression),
+  si           = sum(si)
+), by = is_chronic_derm])
 ```
 
+## Main Analyses (Modified Poisson Risk Ratios)
 
+```{r main_analyses}
+get_rr <- function(outcome_var, title) {
+  # Build the regression frame
+  reg_data <- patient_outcomes[, .(
+    outcome_num = as.numeric(get(outcome_var)),
+    group = as.numeric(is_chronic_derm)
+  )]
+
+  # Modified Poisson with robust SE for risk ratio
+  model <- glm(outcome_num ~ group, family = poisson(link = "log"), data = reg_data)
+  robust <- coeftest(model, vcov = sandwich)
+
+  log_rr <- robust[2, "Estimate"]
+  se     <- robust[2, "Std. Error"]
+  rr     <- exp(log_rr)
+  ci_lo  <- exp(log_rr - 1.96 * se)
+  ci_hi  <- exp(log_rr + 1.96 * se)
+  p      <- robust[2, "Pr(>|z|)"]
+
+  # Cell counts for display
+  n00 <- patient_outcomes[is_chronic_derm == FALSE & get(outcome_var) == FALSE, .N]
+  n01 <- patient_outcomes[is_chronic_derm == FALSE & get(outcome_var) == TRUE,  .N]
+  n10 <- patient_outcomes[is_chronic_derm == TRUE  & get(outcome_var) == FALSE, .N]
+  n11 <- patient_outcomes[is_chronic_derm == TRUE  & get(outcome_var) == TRUE,  .N]
+  tbl <- matrix(c(n00, n01, n10, n11), nrow = 2, byrow = TRUE,
+                dimnames = list(c("Control", "Chronic"), c("No", "Yes")))
+
+  cat("\n", title, "\n")
+  print(tbl)
+  cat("RR:", round(rr, 2),
+      "(95% CI:", round(ci_lo, 2), "-", round(ci_hi, 2), ")\n")
+  cat("P:", format_p(p), "\n")
+
+  list(table = tbl, rr = c(rr, ci_lo, ci_hi), p = p)
+}
+
+# Mutually exclusive severity strata (patient-level, by worst score)
+mild_res         <- get_rr("mild",       "Mild (PHQ 5-9)")
+moderate_res     <- get_rr("moderate",   "Moderate (PHQ 10-14)")
+mod_severe_res   <- get_rr("mod_severe", "Moderately Severe (PHQ 15-19)")
+severe_res       <- get_rr("severe",     "Severe (PHQ 20-27)")
+
+# Any clinical depression (PHQ-9 >= 10)
+any_clinical_res <- get_rr("any_clinical_depression", "Any Clinical Depression (PHQ-9 >= 10)")
+
+# Safety outcome
+si_res           <- get_rr("si", "Suicidal Ideation (Item 9 > 0)")
+```
+
+## Sensitivity Analyses
+
+```{r sensitivity}
+cat("\n========================================\n")
+cat("SENSITIVITY ANALYSES\n")
+cat("========================================\n")
+
+# 1. Continuous PHQ
+cat("\n--- Continuous PHQ-9 ---\n")
+cont_data <- patient_outcomes[!is.na(max_phq)]
+
+chronic_phq <- cont_data[is_chronic_derm == TRUE, max_phq]
+control_phq <- cont_data[is_chronic_derm == FALSE, max_phq]
+
+cat("Chronic: Mean =", round(mean(chronic_phq), 2), "SD =", round(sd(chronic_phq), 2), "\n")
+cat("Control: Mean =", round(mean(control_phq), 2), "SD =", round(sd(control_phq), 2), "\n")
+
+cont_data[, group := as.numeric(is_chronic_derm)]
+lm_fit <- lm(max_phq ~ group, data = cont_data)
+robust_se <- coeftest(lm_fit, vcov = vcovHC(lm_fit, type = "HC1"))
+
+mean_diff <- robust_se["group", "Estimate"]
+se_diff <- robust_se["group", "Std. Error"]
+p_cont <- robust_se["group", "Pr(>|t|)"]
+
+cat("Mean Diff:", round(mean_diff, 2),
+    "(95% CI:", round(mean_diff - 1.96*se_diff, 2), "to", round(mean_diff + 1.96*se_diff, 2), ")\n")
+cat("P:", format_p(p_cont), "\n")
+
+# 2. E-Values for significant findings
+cat("\n--- E-Values ---\n")
+
+calc_evalue <- function(rr, ci_lo) {
+  if (is.na(rr) || rr <= 1) return(c(NA, NA))
+  ev_pt <- rr + sqrt(rr * (rr - 1))
+  ev_ci <- if (!is.na(ci_lo) && ci_lo > 1) ci_lo + sqrt(ci_lo * (ci_lo - 1)) else 1
+  round(c(ev_pt, ev_ci), 2)
+}
+
+ev_mild         <- calc_evalue(mild_res$rr[1],         mild_res$rr[2])
+ev_moderate     <- calc_evalue(moderate_res$rr[1],     moderate_res$rr[2])
+ev_mod_severe   <- calc_evalue(mod_severe_res$rr[1],   mod_severe_res$rr[2])
+ev_severe       <- calc_evalue(severe_res$rr[1],       severe_res$rr[2])
+ev_any_clinical <- calc_evalue(any_clinical_res$rr[1], any_clinical_res$rr[2])
+ev_si           <- calc_evalue(si_res$rr[1],           si_res$rr[2])
+
+cat("Mild (5-9):       RR =", round(mild_res$rr[1], 2),         "E-value =", ev_mild[1], "\n")
+cat("Moderate (10-14): RR =", round(moderate_res$rr[1], 2),     "E-value =", ev_moderate[1], "\n")
+cat("Mod-Severe (15-19): RR =", round(mod_severe_res$rr[1], 2), "E-value =", ev_mod_severe[1], "\n")
+cat("Severe (20-27):   RR =", round(severe_res$rr[1], 2),       "E-value =", ev_severe[1], "\n")
+cat("Any Clinical:     RR =", round(any_clinical_res$rr[1], 2), "E-value =", ev_any_clinical[1], "\n")
+cat("Suicidal Ideation: RR =", round(si_res$rr[1], 2),          "E-value =", ev_si[1], "\n")
+```
+
+## Prior Psychiatric History (Manuscript "Behavioral Health Visit" Claim)
+
+```{r bh_visits}
+# Per manuscript Discussion: "only 3% (n=154) of the dermatology cohort had
+# recorded behavioral health visits within the three-year study period, less
+# than half of those with clinical depression symptoms."
+#
+# This corresponds to the `has_psych_condition` flag built in File 02:
+# psychiatric/behavioral-health visit BEFORE the index dermatologic encounter
+# (i.e., prior psych history). This same flag is used as a matching covariate.
+#
+# This chunk reports two views:
+#   1. has_psych_condition in the full matched cohort (chronic derm vs control)
+#   2. has_psych_condition AMONG patients with PHQ-9 >=10 (clinical depression)
+
+cat("\n========================================\n")
+cat("PRIOR PSYCHIATRIC HISTORY\n")
+cat("========================================\n")
+
+# Bring has_psych_condition from matched_data into patient-level frame
+prior_psych_data <- merge(
+  patient_outcomes[, .(mrn_deid, is_chronic_derm, any_clinical_depression)],
+  matched_data[, .(mrn_deid, has_psych_condition)],
+  by = "mrn_deid"
+)
+
+# Coerce factor TRUE/FALSE to logical for arithmetic
+prior_psych_data[, has_psych := as.logical(has_psych_condition == TRUE | has_psych_condition == "TRUE")]
+
+# ---- Part 1: Prior psych in the FULL matched cohort ----
+cat("\n--- Prior psych history in full matched cohort ---\n")
+prior_all <- prior_psych_data[, .(
+  n_total       = .N,
+  n_prior_psych = sum(has_psych),
+  pct           = round(mean(has_psych) * 100, 1)
+), by = is_chronic_derm]
+print(as.data.frame(prior_all))
+
+# ---- Part 2: Prior psych among PHQ-9 >= 10 patients ----
+cat("\n--- Prior psych history among PHQ-9 >=10 ---\n")
+prior_phq10 <- prior_psych_data[any_clinical_depression == TRUE, .(
+  n_phq10       = .N,
+  n_prior_psych = sum(has_psych),
+  pct           = round(mean(has_psych) * 100, 1)
+), by = is_chronic_derm]
+print(as.data.frame(prior_phq10))
+
+# 2x2 + chi-square test for the proportion difference (PHQ-9 >=10 subset)
+phq10_data <- prior_psych_data[any_clinical_depression == TRUE]
+prior_tab <- with(phq10_data, table(is_chronic_derm, has_psych))
+cat("\n2x2 table (rows = is_chronic_derm, cols = has_psych) among PHQ-9 >=10:\n")
+print(prior_tab)
+
+prior_chi <- chisq.test(prior_tab)
+cat("\nChi-square test for proportion difference (PHQ-9 >=10 subset): P =",
+    format_p(prior_chi$p.value), "\n")
+
+# Risk ratio for prior psych (chronic derm vs control), modified Poisson, PHQ-9 >=10 subset
+phq10_data[, prior_num := as.numeric(has_psych)]
+phq10_data[, group := as.numeric(is_chronic_derm)]
+prior_model <- glm(prior_num ~ group, family = poisson(link = "log"), data = phq10_data)
+prior_robust <- coeftest(prior_model, vcov = sandwich)
+prior_est <- prior_robust["group", "Estimate"]
+prior_se  <- prior_robust["group", "Std. Error"]
+prior_rr  <- exp(prior_est)
+prior_lo  <- exp(prior_est - 1.96*prior_se)
+prior_hi  <- exp(prior_est + 1.96*prior_se)
+cat("\nRisk ratio (chronic vs control), prior psych among PHQ-9 >=10: ",
+    sprintf("%.2f (95%% CI: %.2f-%.2f), P = %s\n",
+            prior_rr, prior_lo, prior_hi, format_p(prior_robust["group", "Pr(>|z|)"])))
+
+# Save (both full-cohort and PHQ>=10 subset)
+prior_output <- rbind(
+  data.table(
+    Subset = "Full matched cohort",
+    Group = c("Control", "Chronic Derm"),
+    N_Total = c(prior_all[is_chronic_derm == FALSE, n_total],
+                prior_all[is_chronic_derm == TRUE,  n_total]),
+    N_Prior_Psych = c(prior_all[is_chronic_derm == FALSE, n_prior_psych],
+                      prior_all[is_chronic_derm == TRUE,  n_prior_psych]),
+    Pct_Prior_Psych = c(prior_all[is_chronic_derm == FALSE, pct],
+                        prior_all[is_chronic_derm == TRUE,  pct])
+  ),
+  data.table(
+    Subset = "PHQ-9 >=10",
+    Group = c("Control", "Chronic Derm"),
+    N_Total = c(prior_phq10[is_chronic_derm == FALSE, n_phq10],
+                prior_phq10[is_chronic_derm == TRUE,  n_phq10]),
+    N_Prior_Psych = c(prior_phq10[is_chronic_derm == FALSE, n_prior_psych],
+                      prior_phq10[is_chronic_derm == TRUE,  n_prior_psych]),
+    Pct_Prior_Psych = c(prior_phq10[is_chronic_derm == FALSE, pct],
+                        prior_phq10[is_chronic_derm == TRUE,  pct])
+  )
+)
+fwrite(prior_output, file.path(csv_dir, "Prior_Psych_History.csv"))
+cat("\nSaved:", file.path(csv_dir, "Prior_Psych_History.csv"), "\n")
+```
+
+## Interaction Analyses
+
+```{r interactions}
+# Per Methods: "Poisson regression with interaction terms was used for
+# interaction analyses between depression symptoms, race and sex."
+#
+# Models fit on the matched cohort. Outcome = any clinical depression (PHQ-9
+# >= 10) at the patient level. Modified Poisson with sandwich SE.
+#
+# Reports per-level interaction term P values, the joint LR test for each
+# interaction (across all levels of the categorical modifier), and stratified
+# RRs within each subgroup. Outputs saved to CSV.
+
+cat("\n========================================\n")
+cat("INTERACTION ANALYSES\n")
+cat("========================================\n")
+
+# Re-attach matching covariates to patient_outcomes
+interaction_data <- merge(
+  patient_outcomes,
+  matched_data[, .(mrn_deid, age_at_encounter, sex, race_ethnicity_combined,
+                   fin_class, has_psych_condition)],
+  by = "mrn_deid"
+)
+
+# Drop sex == "Unknown" and clean factor levels
+interaction_data <- interaction_data[sex != "Unknown" & !is.na(race_ethnicity_combined)]
+interaction_data[, sex := droplevels(factor(sex))]
+interaction_data[, race_ethnicity_combined := droplevels(factor(race_ethnicity_combined))]
+interaction_data[, fin_class := droplevels(factor(fin_class))]
+interaction_data[, any_clinical_num := as.numeric(any_clinical_depression)]
+interaction_data[, group := as.numeric(is_chronic_derm)]
+
+cat("Analysis sample:", nrow(interaction_data), "patients\n")
+cat("  Chronic derm:", sum(interaction_data$is_chronic_derm), "\n")
+cat("  Controls:    ", sum(!interaction_data$is_chronic_derm), "\n\n")
+
+# ----- Race/ethnicity x chronic_derm -----
+cat("--- RACE/ETHNICITY x CHRONIC_DERM ---\n")
+
+race_int_model <- glm(
+  any_clinical_num ~ group * race_ethnicity_combined +
+                     age_at_encounter + sex + fin_class + has_psych_condition,
+  family = poisson(link = "log"),
+  data = interaction_data
+)
+
+race_int_robust <- coeftest(race_int_model, vcov = sandwich)
+race_int_terms <- grep("^group:race_ethnicity_combined", rownames(race_int_robust), value = TRUE)
+
+cat("Per-level interaction term P values:\n")
+for (t in race_int_terms) {
+  cat("  ", t, ": Estimate =", round(race_int_robust[t, "Estimate"], 3),
+      ", P =", format_p(race_int_robust[t, "Pr(>|z|)"]), "\n")
+}
+
+# Joint LR test against no-interaction model
+race_main_model <- glm(
+  any_clinical_num ~ group + race_ethnicity_combined +
+                     age_at_encounter + sex + fin_class + has_psych_condition,
+  family = poisson(link = "log"),
+  data = interaction_data
+)
+race_lr <- anova(race_main_model, race_int_model, test = "Chisq")
+race_joint_p <- race_lr$`Pr(>Chi)`[2]
+cat("\nJoint LR test (race x group):  P =", format_p(race_joint_p), "\n\n")
+
+# Stratified RRs by race
+cat("Stratified RRs (chronic vs control), by race/ethnicity:\n")
+race_strat_rows <- list()
+for (lvl in levels(interaction_data$race_ethnicity_combined)) {
+  sub <- interaction_data[race_ethnicity_combined == lvl]
+  if (sum(sub$group == 1) < 10 || sum(sub$group == 0) < 10) {
+    cat("  ", lvl, ": n too small, skipped\n")
+    next
+  }
+  m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub)
+  rb <- coeftest(m, vcov = sandwich)
+  est <- rb["group", "Estimate"]
+  se  <- rb["group", "Std. Error"]
+  pv  <- rb["group", "Pr(>|z|)"]
+  rr  <- exp(est)
+  lo  <- exp(est - 1.96*se)
+  hi  <- exp(est + 1.96*se)
+  cat(sprintf("  %-22s  RR = %.2f (95%% CI: %.2f-%.2f), P = %s   [n_case=%d, n_ctrl=%d]\n",
+              lvl, rr, lo, hi, format_p(pv),
+              sum(sub$group == 1), sum(sub$group == 0)))
+  race_strat_rows[[lvl]] <- data.table(
+    Modifier = "Race/Ethnicity", Level = lvl,
+    N_Case = sum(sub$group == 1), N_Ctrl = sum(sub$group == 0),
+    RR = round(rr, 2), CI_lo = round(lo, 2), CI_hi = round(hi, 2),
+    P = pv
+  )
+}
+
+# ----- Sex x chronic_derm -----
+cat("\n--- SEX x CHRONIC_DERM ---\n")
+
+sex_int_model <- glm(
+  any_clinical_num ~ group * sex +
+                     age_at_encounter + race_ethnicity_combined + fin_class + has_psych_condition,
+  family = poisson(link = "log"),
+  data = interaction_data
+)
+
+sex_int_robust <- coeftest(sex_int_model, vcov = sandwich)
+sex_int_terms <- grep("^group:sex", rownames(sex_int_robust), value = TRUE)
+
+cat("Per-level interaction term P values:\n")
+for (t in sex_int_terms) {
+  cat("  ", t, ": Estimate =", round(sex_int_robust[t, "Estimate"], 3),
+      ", P =", format_p(sex_int_robust[t, "Pr(>|z|)"]), "\n")
+}
+
+sex_main_model <- glm(
+  any_clinical_num ~ group + sex +
+                     age_at_encounter + race_ethnicity_combined + fin_class + has_psych_condition,
+  family = poisson(link = "log"),
+  data = interaction_data
+)
+sex_lr <- anova(sex_main_model, sex_int_model, test = "Chisq")
+sex_joint_p <- sex_lr$`Pr(>Chi)`[2]
+cat("\nJoint LR test (sex x group):  P =", format_p(sex_joint_p), "\n\n")
+
+# Stratified RRs by sex
+cat("Stratified RRs (chronic vs control), by sex:\n")
+sex_strat_rows <- list()
+for (lvl in levels(interaction_data$sex)) {
+  sub <- interaction_data[sex == lvl]
+  if (sum(sub$group == 1) < 10 || sum(sub$group == 0) < 10) {
+    cat("  ", lvl, ": n too small, skipped\n")
+    next
+  }
+  m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub)
+  rb <- coeftest(m, vcov = sandwich)
+  est <- rb["group", "Estimate"]
+  se  <- rb["group", "Std. Error"]
+  pv  <- rb["group", "Pr(>|z|)"]
+  rr  <- exp(est)
+  lo  <- exp(est - 1.96*se)
+  hi  <- exp(est + 1.96*se)
+  cat(sprintf("  %-10s  RR = %.2f (95%% CI: %.2f-%.2f), P = %s   [n_case=%d, n_ctrl=%d]\n",
+              lvl, rr, lo, hi, format_p(pv),
+              sum(sub$group == 1), sum(sub$group == 0)))
+  sex_strat_rows[[lvl]] <- data.table(
+    Modifier = "Sex", Level = lvl,
+    N_Case = sum(sub$group == 1), N_Ctrl = sum(sub$group == 0),
+    RR = round(rr, 2), CI_lo = round(lo, 2), CI_hi = round(hi, 2),
+    P = pv
+  )
+}
+
+# ----- Save -----
+interaction_summary <- data.table(
+  Modifier = c("Race/Ethnicity", "Sex"),
+  Joint_P_Value = c(format_p(race_joint_p), format_p(sex_joint_p))
+)
+fwrite(interaction_summary, file.path(csv_dir, "Interaction_Tests.csv"))
+
+stratified_rrs <- rbindlist(c(race_strat_rows, sex_strat_rows))
+fwrite(stratified_rrs, file.path(csv_dir, "Stratified_RRs_By_Subgroup.csv"))
+
+cat("\nSaved:\n")
+cat("  ", file.path(csv_dir, "Interaction_Tests.csv"), "\n")
+cat("  ", file.path(csv_dir, "Stratified_RRs_By_Subgroup.csv"), "\n")
+```
+
+## Summary Table
+
+```{r summary_table}
+summary_results <- data.table(
+  Analysis = c("Mild (PHQ 5-9)", "Moderate (PHQ 10-14)",
+               "Moderately Severe (PHQ 15-19)", "Severe (PHQ 20-27)",
+               "Any Clinical Depression (PHQ >= 10)", "Suicidal Ideation",
+               "Continuous PHQ"),
+  Measure = c("RR", "RR", "RR", "RR", "RR", "RR", "Mean Diff"),
+  Estimate = round(c(mild_res$rr[1], moderate_res$rr[1], mod_severe_res$rr[1],
+                     severe_res$rr[1], any_clinical_res$rr[1], si_res$rr[1], mean_diff), 2),
+  CI_Lower = round(c(mild_res$rr[2], moderate_res$rr[2], mod_severe_res$rr[2],
+                     severe_res$rr[2], any_clinical_res$rr[2], si_res$rr[2],
+                     mean_diff - 1.96*se_diff), 2),
+  CI_Upper = round(c(mild_res$rr[3], moderate_res$rr[3], mod_severe_res$rr[3],
+                     severe_res$rr[3], any_clinical_res$rr[3], si_res$rr[3],
+                     mean_diff + 1.96*se_diff), 2),
+  P = c(format_p(mild_res$p), format_p(moderate_res$p), format_p(mod_severe_res$p),
+        format_p(severe_res$p), format_p(any_clinical_res$p), format_p(si_res$p),
+        format_p(p_cont)),
+  E_Value_Point = c(ev_mild[1], ev_moderate[1], ev_mod_severe[1], ev_severe[1],
+              ev_any_clinical[1], ev_si[1], NA),
+  E_Value_CI = c(ev_mild[2], ev_moderate[2], ev_mod_severe[2], ev_severe[2],
+              ev_any_clinical[2], ev_si[2], NA)
+)
+
+# Create CI column
+summary_results[, CI := paste0("(", CI_Lower, ", ", CI_Upper, ")")]
+
+# Select columns for display
+display_cols <- summary_results[, .(Analysis, Measure, Estimate, CI, P, E_Value_Point, E_Value_CI)]
+
+# Build gt table
+summary_gt <- gt(display_cols)
+summary_gt <- tab_header(summary_gt,
+                         title = "Combined Cohort: Depression Severity",
+                         subtitle = "Chronic Dermatologic Conditions vs Matched Controls (Modified Poisson Risk Ratios)")
+summary_gt <- cols_label(summary_gt,
+                         Analysis = "PHQ-9 Category", Measure = "Measure",
+                         Estimate = "Estimate", CI = "95% CI", P = "P",
+                         E_Value_Point = "E-Value (Point)",
+                         E_Value_CI = "E-Value (CI)")
+summary_gt <- tab_options(summary_gt, table.font.size = px(11), column_labels.font.weight = "bold")
+summary_gt <- tab_footnote(summary_gt,
+                           "Severity strata are mutually exclusive at the patient level, assigned by worst PHQ-9 score. RRs estimated via modified Poisson regression with robust (sandwich) variance. E-values show minimum confounder strength to explain away association (Point) or shift the lower CI bound to the null (CI).",
+                           locations = cells_column_labels(columns = E_Value_Point))
+
+print(summary_gt)
+
+# PNG save disabled — Chrome not available on WinStats
+# gtsave(summary_gt, file.path(tables_dir, "Combined_Cohort_Severity.png"))
+
+fwrite(summary_results, file.path(csv_dir, "Combined_Cohort_Severity.csv"))
+
+cat("\n=== FILE 04 COMPLETE ===\n")
+cat("CSV saved to:", file.path(csv_dir, "Combined_Cohort_Severity.csv"), "\n")
+```
