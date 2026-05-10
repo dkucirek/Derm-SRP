@@ -23,12 +23,12 @@ data_path <- "Z:/Kucirek/"
 result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
 setDT(result_wide)
 
-#check that columns from 01 exist
-required_cols <- c("phq2_manual_posneg", "phq9_manual_sum")
+#check that required PHQ columns from 01 exist
+required_cols <- c("phq_score", "phq_type_used", "phq_severity", "phq_clinical", "phq_subclinical")
 missing_cols <- setdiff(required_cols, names(result_wide))
 
 if (length(missing_cols) > 0) {
-  stop(paste("Error: The following required columns are missing from result_wide.rds:", 
+  stop(paste("Error: The following required PHQ columns are missing from result_wide.rds:", 
              paste(missing_cols, collapse = ", "), 
              "\nPlease re-run '01_joining_and_cohort_definition.Rmd' to regenerate the data files."))
 }
@@ -62,8 +62,11 @@ result_info[, ethnic_refined := fcase(
 )]
 
 result_info[, race_refined := fcase(
-  race %in% c("Asian Indian", "Asian/Mideast Indian"), "South Asian",
-  race %in% c("Chinese", "Japanese", "Korean", "Filipino", "Vietnamese", "Native Hawaiian", "Native Hawaiian/Other Pacific Islander", "Other Pacific Islander", "Guamanian or Chamorro", "Samoan", "American Indian or Alaska Native", "None of the above", "Other"), "Other",
+  race %in% c("Asian Indian", "Asian/Mideast Indian", 
+              "Chinese", "Japanese", "Korean", "Filipino", "Vietnamese"), "Asian",
+  race %in% c("Native Hawaiian", "Native Hawaiian/Other Pacific Islander", 
+              "Other Pacific Islander", "Guamanian or Chamorro", "Samoan",
+              "American Indian or Alaska Native", "None of the above", "Other"), "Other",
   race == "White", "White",
   race == "Black or African-American", "Black or African American",
   race == "More than one Race", "More than one Race",
@@ -71,30 +74,73 @@ result_info[, race_refined := fcase(
   default = "Other"
 )]
 
-# save result_info.rds 
-saveRDS(result_info, file.path(data_path, "result_info.rds"))
-cat(paste("result_info.rds saved to:", data_path, "\n"))
+# Combined race/ethnicity per manuscript Table 1 categories:
+# Non-Hispanic White, Non-Hispanic Black, Asian, Hispanic, Other, Declined/NA
+# Combined race/ethnicity per manuscript Table 1 categories:
+# Non-Hispanic White, Non-Hispanic Black, Asian, Hispanic, Other, Declined/NA
+hispanic_values <- c("Hispanic or Latino",
+                     "Mexican, Mexican American, or Chicano/a",
+                     "Puerto Rican", "Cuban",
+                     "Other Hispanic, Latino/a, or Spanish origin")
+
+result_info[, race_ethnicity_combined := fcase(
+  # Hispanic takes precedence over race
+  ethnic %in% hispanic_values, "Hispanic",
+  
+  # Then non-Hispanic categories by race
+  race == "White", "Non-Hispanic White",
+  race == "Black or African-American", "Non-Hispanic Black",
+  
+  # Asian (combines East and South Asian per manuscript Table 1)
+  race %in% c("Asian Indian", "Asian/Mideast Indian", "Chinese", "Japanese",
+              "Korean", "Filipino", "Vietnamese"), "Asian",
+  
+  # Declined/NA — keep separate from Other
+  race %in% c("Unknown or Patient unable to respond",
+              "Patient declines to respond"), "Declined/NA",
+  
+  # Everything else (Pacific Islander, AI/AN, More than one Race, Other)
+  default = "Other"
+)]
+
+result_info[, race_ethnicity_combined := factor(race_ethnicity_combined,
+  levels = c("Non-Hispanic White", "Non-Hispanic Black", "Asian",
+             "Hispanic", "Other", "Declined/NA"))]
 ```
 
 ### Prepare Data for Propensity Score Matching
 
 ```{r}
-# load 
+# load required data files
 chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
+chronic_derm_phq_summary <- readRDS(file.path(data_path, "chronic_derm_phq_summary.rds"))
 setDT(chronic_derm_cohort)
+setDT(chronic_derm_phq_summary)
 
 # define chronic derm patients 
 chronic_derm_mrns <- unique(chronic_derm_cohort$mrn_deid)
 
-# make patient-level dataset with covariates
-patient_data_for_matching <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, fin_class)]
-patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_mrns]
+# Safety check
+if (length(chronic_derm_mrns) == 0) {
+  warning("No chronic derm patients found in loaded cohort - check File 01 processing!")
+}
+
+# Create final consistent dataset: chronic derm patients (already have PHQ data by inclusion criteria) WITH complete demographic data
+chronic_derm_with_phq <- chronic_derm_mrns  # All chronic derm patients now have PHQ data by design
+cat("Chronic derm patients with PHQ data:", length(chronic_derm_with_phq), "(100% by File 01 inclusion criteria)\n")
+
+patient_data_for_matching <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, race_ethnicity_combined, fin_class)]
+patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_with_phq]
 
 # prepare covariates
 patient_data_for_matching[, sex := factor(sex)]
 patient_data_for_matching[, race_refined := factor(race_refined)]
 patient_data_for_matching[, ethnic_refined := factor(ethnic_refined)]
 patient_data_for_matching[, fin_class := factor(fin_class)]
+# race_ethnicity_combined already factored in result_info, but ensure consistency
+patient_data_for_matching[, race_ethnicity_combined := factor(race_ethnicity_combined,
+  levels = c("Non-Hispanic White", "Non-Hispanic Black", "Asian",
+             "Hispanic", "Other", "Declined/NA"))]
 
 # calculate approximate number of visits
 patient_visits <- result_wide[, .N, by = mrn_deid]
@@ -138,13 +184,38 @@ patient_data_for_matching[, has_psych_condition := factor(has_psych_condition_ti
 
 # get all unique department names that matched the psych patterns (for reporting)
 all_matched_dept_names <- unique(all_psych_encounters$appt_dept)
+matched_dept_names_table <- data.table(matched_dept_name = all_matched_dept_names)
+
+# Display in terminal
+cat("\n=== MATCHED PSYCHIATRIC DEPARTMENT NAMES ===\n")
+print(matched_dept_names_table)
+
+# Save to file
 matched_dept_names_output_path <- file.path(data_path, "matched_psych_department_names.csv")
-fwrite(data.table(matched_dept_name = all_matched_dept_names), matched_dept_names_output_path)
+fwrite(matched_dept_names_table, matched_dept_names_output_path)
 cat(paste0("List of matched psychiatric department names saved to: ", matched_dept_names_output_path, "\n"))
 
+# Apply final filtering to keep only patients with complete data for matching
 initial_rows <- nrow(patient_data_for_matching)
-patient_data_for_matching <- na.omit(patient_data_for_matching, cols = c("age_at_encounter", "sex", "race_refined", "ethnic_refined", "fin_class", "num_visits", "has_psych_condition"))
+initial_chronic_derm <- sum(patient_data_for_matching$is_chronic_derm)
+
+# Filter to only patients with complete data AND adjust chronic derm status
+complete_data_patients <- patient_data_for_matching[!is.na(age_at_encounter) & !is.na(sex) & 
+                                                   !is.na(race_refined) & !is.na(ethnic_refined) & 
+                                                   !is.na(race_ethnicity_combined) &
+                                                   !is.na(fin_class) & !is.na(num_visits) & 
+                                                   !is.na(has_psych_condition)]
+
+# For chronic derm patients: only keep those with complete data
+chronic_derm_final <- complete_data_patients[is_chronic_derm == TRUE, mrn_deid]
+cat("Final chronic derm patients (complete covariates, PHQ guaranteed by File 01):", length(chronic_derm_final), "\n")
+
+# Keep all control patients with complete data, only chronic derm patients with complete data
+patient_data_for_matching <- complete_data_patients
+patient_data_for_matching[, is_chronic_derm := mrn_deid %in% chronic_derm_final]
+
 cat(paste0("Removed ", initial_rows - nrow(patient_data_for_matching), " rows due to missing covariate data.\n"))
+cat(paste0("Final chronic derm patients in matching dataset: ", sum(patient_data_for_matching$is_chronic_derm), "\n"))
 
 # make sure column names are clean 
 current_names <- names(patient_data_for_matching)
@@ -154,6 +225,13 @@ for (col_name in c("age_at_encounter", "sex", "race_refined", "ethnic_refined", 
   }
 }
 
+# Sanity check: verify race/ethnicity distribution against manuscript Table 1
+cat("\nRace/ethnicity by group (verify against manuscript Table 1):\n")
+race_eth_check <- patient_data_for_matching[, .N, 
+                                              by = .(race_ethnicity_combined, is_chronic_derm)][
+                                              order(is_chronic_derm, race_ethnicity_combined)]
+print(as.data.frame(race_eth_check))
+
 # save data
 output_prepared_data_rds <- file.path(data_path, "patient_data_for_matching.rds")
 saveRDS(patient_data_for_matching, output_prepared_data_rds)
@@ -162,8 +240,143 @@ cat(paste("Prepared data for propensity score matching saved to:", output_prepar
 
 cat("Summary of prepared data:\n")
 print(patient_data_for_matching[, .N, by = is_chronic_derm])
-
+cat("VERIFICATION: Chronic derm patients in saved file:", sum(patient_data_for_matching$is_chronic_derm), "\n")
 ```
+## Unmatched Cohort Comparison (Manuscript NL12 Paragraph)
+
+```{r unmatched_comparison}
+# Compare chronic derm cohort vs all eligible (unmatched) controls on
+# demographic variables. These produce the P values reported in the manuscript
+# Results paragraph: "more female (77% vs 62%; p < .001), Non-Hispanic Black
+# (45% vs 33%; p < .001), younger (43 [17] vs 51 [19] years, p < .001),
+# privately insured (66% vs 60%; p < .001)".
+
+cat("\n========================================\n")
+cat("UNMATCHED COHORT DEMOGRAPHIC COMPARISON\n")
+cat("========================================\n")
+cat("Chronic derm:      ", sum(patient_data_for_matching$is_chronic_derm), "\n")
+cat("Unmatched controls:", sum(!patient_data_for_matching$is_chronic_derm), "\n\n")
+
+# ---- Sex ----
+cat("--- Sex (Female vs Male; chi-square) ---\n")
+sex_tab <- with(sex_data, table(is_chronic_derm, droplevels(factor(sex))))
+print(sex_tab)
+cat(sprintf("Pct female (chronic): %.1f%%   (%d/%d)\n",
+            100 * sex_tab["TRUE", "Female"] / sum(sex_tab["TRUE", ]),
+            sex_tab["TRUE", "Female"], sum(sex_tab["TRUE", ])))
+cat(sprintf("Pct female (control): %.1f%%   (%d/%d)\n",
+            100 * sex_tab["FALSE", "Female"] / sum(sex_tab["FALSE", ]),
+            sex_tab["FALSE", "Female"], sum(sex_tab["FALSE", ])))
+chi_sex <- chisq.test(sex_tab)
+cat("Chi-square P:", format.pval(chi_sex$p.value, eps = 0.001), "\n\n")
+
+# ---- Race/Ethnicity ----
+cat("--- Race/Ethnicity (overall + NH Black 2x2) ---\n")
+race_tab <- with(patient_data_for_matching,
+                 table(is_chronic_derm, race_ethnicity_combined))
+print(race_tab)
+race_pct_chronic <- 100 * race_tab["TRUE", ] / sum(race_tab["TRUE", ])
+race_pct_control <- 100 * race_tab["FALSE", ] / sum(race_tab["FALSE", ])
+cat("\nPct by race (chronic / control):\n")
+for (lvl in colnames(race_tab)) {
+  cat(sprintf("  %-22s %5.1f%% / %5.1f%%\n",
+              lvl, race_pct_chronic[lvl], race_pct_control[lvl]))
+}
+chi_race <- chisq.test(race_tab)
+cat(sprintf("\nChi-square P (overall, %d df): %s\n",
+            chi_race$parameter, format.pval(chi_race$p.value, eps = 0.001)))
+
+# 2x2 specifically for NH Black vs not (manuscript reports this single comparison)
+nhb_tab <- with(patient_data_for_matching,
+                table(is_chronic_derm,
+                      race_ethnicity_combined == "Non-Hispanic Black"))
+colnames(nhb_tab) <- c("Other", "NH_Black")
+chi_nhb <- chisq.test(nhb_tab)
+cat(sprintf("Chi-square P (NH Black vs other): %s\n",
+            format.pval(chi_nhb$p.value, eps = 0.001)))
+cat(sprintf("Pct NH Black (chronic): %.1f%%   Pct NH Black (control): %.1f%%\n\n",
+            100 * nhb_tab["TRUE", "NH_Black"] / sum(nhb_tab["TRUE", ]),
+            100 * nhb_tab["FALSE", "NH_Black"] / sum(nhb_tab["FALSE", ])))
+
+# ---- Insurance (Private Payors vs not) ----
+cat("--- Insurance (Private Payors 2x2) ---\n")
+priv_tab <- with(patient_data_for_matching,
+                 table(is_chronic_derm,
+                       fin_class == "Private Payors"))
+colnames(priv_tab) <- c("Other", "Private")
+print(priv_tab)
+cat(sprintf("Pct private (chronic): %.1f%%   (%d/%d)\n",
+            100 * priv_tab["TRUE", "Private"] / sum(priv_tab["TRUE", ]),
+            priv_tab["TRUE", "Private"], sum(priv_tab["TRUE", ])))
+cat(sprintf("Pct private (control): %.1f%%   (%d/%d)\n",
+            100 * priv_tab["FALSE", "Private"] / sum(priv_tab["FALSE", ]),
+            priv_tab["FALSE", "Private"], sum(priv_tab["FALSE", ])))
+chi_priv <- chisq.test(priv_tab)
+cat("Chi-square P:", format.pval(chi_priv$p.value, eps = 0.001), "\n\n")
+
+# ---- Age (Welch t-test) ----
+cat("--- Age (Welch t-test) ---\n")
+age_chronic <- patient_data_for_matching[is_chronic_derm == TRUE, age_at_encounter]
+age_control <- patient_data_for_matching[is_chronic_derm == FALSE, age_at_encounter]
+cat(sprintf("Chronic mean age: %.1f (SD %.1f), median %.0f, n=%d\n",
+            mean(age_chronic, na.rm = TRUE), sd(age_chronic, na.rm = TRUE),
+            median(age_chronic, na.rm = TRUE), sum(!is.na(age_chronic))))
+cat(sprintf("Control mean age: %.1f (SD %.1f), median %.0f, n=%d\n",
+            mean(age_control, na.rm = TRUE), sd(age_control, na.rm = TRUE),
+            median(age_control, na.rm = TRUE), sum(!is.na(age_control))))
+t_age <- t.test(age_at_encounter ~ is_chronic_derm,
+                data = patient_data_for_matching)
+cat("Welch t-test P:", format.pval(t_age$p.value, eps = 0.001), "\n\n")
+
+# ---- Save summary CSV ----
+unmatched_summary <- data.table(
+  Variable = c("Female (% of total)",
+               "Non-Hispanic Black (% of total)",
+               "Private Payors (% of total)",
+               "Age (mean, SD)"),
+  Pct_or_Mean_Chronic = c(
+    sprintf("%.1f%% (%d/%d)",
+            100 * sex_tab["TRUE", "Female"] / sum(sex_tab["TRUE", ]),
+            sex_tab["TRUE", "Female"], sum(sex_tab["TRUE", ])),
+    sprintf("%.1f%% (%d/%d)",
+            100 * nhb_tab["TRUE", "NH_Black"] / sum(nhb_tab["TRUE", ]),
+            nhb_tab["TRUE", "NH_Black"], sum(nhb_tab["TRUE", ])),
+    sprintf("%.1f%% (%d/%d)",
+            100 * priv_tab["TRUE", "Private"] / sum(priv_tab["TRUE", ]),
+            priv_tab["TRUE", "Private"], sum(priv_tab["TRUE", ])),
+    sprintf("%.1f (SD %.1f)", mean(age_chronic, na.rm = TRUE),
+            sd(age_chronic, na.rm = TRUE))
+  ),
+  Pct_or_Mean_Control = c(
+    sprintf("%.1f%% (%d/%d)",
+            100 * sex_tab["FALSE", "Female"] / sum(sex_tab["FALSE", ]),
+            sex_tab["FALSE", "Female"], sum(sex_tab["FALSE", ])),
+    sprintf("%.1f%% (%d/%d)",
+            100 * nhb_tab["FALSE", "NH_Black"] / sum(nhb_tab["FALSE", ]),
+            nhb_tab["FALSE", "NH_Black"], sum(nhb_tab["FALSE", ])),
+    sprintf("%.1f%% (%d/%d)",
+            100 * priv_tab["FALSE", "Private"] / sum(priv_tab["FALSE", ]),
+            priv_tab["FALSE", "Private"], sum(priv_tab["FALSE", ])),
+    sprintf("%.1f (SD %.1f)", mean(age_control, na.rm = TRUE),
+            sd(age_control, na.rm = TRUE))
+  ),
+  Test = c("Chi-square", "Chi-square (NH Black vs other)",
+           "Chi-square (Private vs other)", "Welch t-test"),
+  P_Value = c(format.pval(chi_sex$p.value, eps = 0.001),
+              format.pval(chi_nhb$p.value, eps = 0.001),
+              format.pval(chi_priv$p.value, eps = 0.001),
+              format.pval(t_age$p.value, eps = 0.001))
+)
+
+# Build csv_dir if it doesn't exist (File 02 doesn't currently use one)
+csv_dir <- file.path("C:/Users/dkucirek/Documents/Derm-SRP", "csv")
+if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
+
+fwrite(unmatched_summary, file.path(csv_dir, "Unmatched_Comparison.csv"))
+cat("Saved:", file.path(csv_dir, "Unmatched_Comparison.csv"), "\n")
+print(unmatched_summary)
+```
+
 
 ### Analyze Specific Chronic Derm ICD Codes
 
@@ -178,17 +391,18 @@ icd_codes_of_interest <- c(
   "L63",   # Alopecia areata
   "L40",   # Psoriasis
   "L93",   # Lupus erythematosus
+  "M32.8",
   "M32.9", # Systemic lupus erythematosus, unspecified
   "M32.1"  # Systemic lupus erythematosus, other
 )
 
-pattern <- paste0("^( ", paste(icd_codes_of_interest, collapse = "|"), ")")
+pattern <- paste(icd_codes_of_interest, collapse = "|")
 
 filtered_encounters <- result_wide[str_detect(icd10_dx, pattern)]
 
 # summarize, show results 
 if (nrow(filtered_encounters) > 0) {
-  filtered_encounters[, icd_category := str_extract(icd10_dx, pattern)]
+  filtered_encounters[, icd_category := str_extract(icd10_dx, paste(icd_codes_of_interest, collapse = "|"))]
 
   icd_counts <- filtered_encounters[, .N, by = icd_category][order(-N)]
 
@@ -200,8 +414,27 @@ if (nrow(filtered_encounters) > 0) {
     appt_dept
   )]
 
+  # Display in terminal
+  cat("\n=== SPECIFIC ICD ENCOUNTERS ===\n")
+  print(results_list)
+  
   #save to CSV
   output_file <- "specific_icd_encounters.csv"
   fwrite(results_list, file.path(data_path, output_file))
 }
+
+# Save PHQ severity summary for later use
+cat("Saving PHQ severity summary data...\n")
+
+# Display in terminal
+cat("\n=== CHRONIC DERM PHQ SEVERITY SUMMARY ===\n")
+print(chronic_derm_phq_summary)
+
+fwrite(chronic_derm_phq_summary, file.path(data_path, "chronic_derm_phq_severity_summary.csv"))
+
+library(data.table)
+pd <- readRDS("Z:/Kucirek/patient_data_for_matching.rds")
+setDT(pd)
+print(as.data.frame(pd[, .N, by = .(race_ethnicity_combined, is_chronic_derm)][
+  order(is_chronic_derm, race_ethnicity_combined)]))
 ```
