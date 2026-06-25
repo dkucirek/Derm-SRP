@@ -145,7 +145,7 @@ if (ncol(phq_value_wide) > 10) {
            paste0("phq_value_", names(phq_value_wide)[11:ncol(phq_value_wide)]))
 }
 
-# merge the three wide datasets using data.table joins
+# merge wide datasets using data.table joins
 cat("Merging datasets...\n")
 result_wide <- phq_value_wide
 
@@ -169,7 +169,7 @@ cat("Data reshaping complete. Final dimensions:", nrow(result_wide), "x", ncol(r
 # standardize column names
 cat("Standardizing column names...\n")
 
-# batch renaming
+# renaming
 column_mappings <- list(
   "phq_value_CMS.PHQ.2.POS.NEG" = "phq_value_CMS_PHQ-2_POS/NEG",
   "phq_value_CMS.PHQ.9.POS.NEG" = "phq_value_CMS_PHQ-9_POS/NEG", 
@@ -188,7 +188,7 @@ for (old_name in names(column_mappings)) {
 
 cat("Column standardization complete.\n")
 
-# --- manual PHQ-9 score calculation ---
+# manual PHQ-9 score calculation
 phq9_items <- c(
   "phq_value_num_feeling tired or having little energy score",
   "phq_value_num_poor appetite or overeating score",
@@ -210,7 +210,6 @@ phq2_items <- c(
 # Convert to data.table first
 setDT(result_wide)
 
-# --- HIERARCHICAL PHQ SEVERITY SCORING ---
 # Find correct PHQ column names after standardization
 phq_columns <- names(result_wide)[grepl("phq", names(result_wide), ignore.case = TRUE)]
 
@@ -226,7 +225,7 @@ cat("PHQ column detection:\n")
 cat("- PHQ9 column:", ifelse(is.na(phq9_col_name), "NOT FOUND", phq9_col_name), "\n")
 cat("- PHQ2 column:", ifelse(is.na(phq2_col_name), "NOT FOUND", phq2_col_name), "\n")
 
-# Create hierarchical PHQ scoring
+# hierarchical PHQ scoring
 if (!is.na(phq9_col_name)) {
   result_wide[, (phq9_col_name) := as.numeric(get(phq9_col_name))]
 }
@@ -234,7 +233,7 @@ if (!is.na(phq2_col_name)) {
   result_wide[, (phq2_col_name) := as.numeric(get(phq2_col_name))]
 }
 
-# Create hierarchical score (PHQ9 preferred, PHQ2 fallback)
+# Create score (PHQ9 preferred, PHQ2 fallback)
 result_wide[, phq_score := {
   if (!is.na(phq9_col_name) && !is.na(phq2_col_name)) {
     fifelse(!is.na(get(phq9_col_name)), get(phq9_col_name),
@@ -262,7 +261,7 @@ result_wide[, phq_type_used := {
   }
 }]
 
-# Create 5-category severity classification
+# Create severity classification
 result_wide[, phq_severity := fifelse(is.na(phq_score), "Missing",
                               fifelse(phq_score <= 4, "Negative",
                               fifelse(phq_score <= 9, "Mild",
@@ -289,8 +288,8 @@ validate_clinical_phq_data <- function(data) {
   return(data)
 }
 
-# Debug: Verify columns were created
-cat("\n=== CLINICAL/SUBCLINICAL COLUMNS VERIFICATION ===\n")
+# Verify columns were created
+cat("\n=== COLUMNS VERIFICATION ===\n")
 cat("phq_clinical column exists:", "phq_clinical" %in% names(result_wide), "\n")
 cat("phq_subclinical column exists:", "phq_subclinical" %in% names(result_wide), "\n")
 if ("phq_clinical" %in% names(result_wide)) {
@@ -300,13 +299,10 @@ if ("phq_subclinical" %in% names(result_wide)) {
   cat("Subclinical depression cases:", sum(result_wide$phq_subclinical, na.rm = TRUE), "\n")
 }
 
-
-# --- Print PHQ scoring summary ---
-cat("\n=== PHQ HIERARCHICAL SCORING SUMMARY ===\n")
+cat("\n=== PHQ SCORING SUMMARY ===\n")
 cat("Total encounters:", nrow(result_wide), "\n")
 
-# COMPREHENSIVE PHQ DATA UTILIZATION REPORT  
-cat("=== PHQ DATA UTILIZATION ANALYSIS ===\n")
+cat("=== PHQ DATA ANALYSIS ===\n")
 
 # Count encounters with PHQ data
 cat("PHQ DATA SUMMARY:\n")
@@ -318,7 +314,7 @@ if (!is.na(phq2_col_name)) {
 }
 cat("- Total encounters with usable PHQ scores:", sum(!is.na(result_wide$phq_score)), "\n")
 
-# Show final PHQ type usage
+# Show final PHQ type 
 phq_type_counts <- result_wide[, .N, by = phq_type_used]
 cat("\nFINAL PHQ TYPE USAGE:\n")
 print(phq_type_counts)
@@ -347,8 +343,7 @@ cat("Patients with no PHQ data:", sum(!patient_phq_summary$has_any_phq), "\n")
 ### Define and Save Cohorts
 
 ```{r}
-# Define ICD-10 codes for chronic dermatological conditions
-# Complete list with descriptions available in Supplemental Table S1 at end of File 7
+# Define ICD-10 codes for derm conditions
 chronic_condition_icd_codes <- list(
   "Scarring Alopecia" = "L66",
   "Acne" = "L70",
@@ -361,14 +356,13 @@ chronic_condition_icd_codes <- list(
   "Lupus Erythematosus" = c("L93", "M32.1", "M32.8", "M32.9")
 )
 
-# make one regex pattern from all codes for efficient filtering (text string used to define search pattern)
+# make one regex pattern from all codes for filtering 
 all_chronic_codes <- unlist(chronic_condition_icd_codes)
 chronic_pattern <- paste(all_chronic_codes, collapse = "|")
 
-# ===== COMPREHENSIVE CONDITION ASSIGNMENT - SINGLE SOURCE OF TRUTH =====
-cat("\n=== CREATING MASTER CONDITION ASSIGNMENTS ===\n")
+cat("\n=== CREATING CONDITION ASSIGNMENTS ===\n")
 
-# Create comprehensive patient-condition matrix 
+# Create patient condition matrix 
 chronic_derm_patient_conditions <- list()
 condition_patient_counts <- list()
 
@@ -376,7 +370,7 @@ for (condition_name in names(chronic_condition_icd_codes)) {
   icd_codes <- chronic_condition_icd_codes[[condition_name]]
   condition_pattern <- paste(icd_codes, collapse = "|")
   
-  # Find ALL patients with this condition (with PHQ data requirement)
+  # Find patients with this condition (with PHQ data requirement)
   patients_with_condition <- unique(result_wide[str_detect(icd10_dx, condition_pattern) & !is.na(phq_score), mrn_deid])
   
   chronic_derm_patient_conditions[[condition_name]] <- patients_with_condition
@@ -385,16 +379,16 @@ for (condition_name in names(chronic_condition_icd_codes)) {
   cat(paste0("  ", condition_name, ": ", length(patients_with_condition), " patients\n"))
 }
 
-# Create overall chronic derm cohort (same as before for compatibility)
+# Create overall chronic derm cohort 
 chronic_derm_cohort <- result_wide[str_detect(icd10_dx, chronic_pattern) & !is.na(phq_score)]
 
-# Safety check for empty cohort
+# Safety check 
 if (nrow(chronic_derm_cohort) == 0) {
   warning("No patients found with both chronic dermatology conditions AND PHQ data!")
 }
 
-# Create MASTER chronic derm dataset with pre-assigned conditions
-cat("\n=== CREATING MASTER CHRONIC DERM DATASET ===\n")
+# Create chronic derm dataset with conditions
+cat("\n=== CREATING MASTER DERM DATASET ===\n")
 chronic_derm_master <- result_wide[mrn_deid %in% unique(chronic_derm_cohort$mrn_deid)]
 
 # Add condition assignment columns for consistent use across all files
@@ -405,7 +399,7 @@ for (condition_name in names(chronic_condition_icd_codes)) {
   condition_col_name <- gsub("_+", "_", condition_col_name)  # Remove multiple underscores
   condition_col_name <- gsub("_$", "", condition_col_name)   # Remove trailing underscore
   
-  # Store mapping for later use
+  # Store for later use
   condition_column_mapping[[condition_name]] <- condition_col_name
   
   # Add column to master dataset
@@ -413,7 +407,7 @@ for (condition_name in names(chronic_condition_icd_codes)) {
   cat(paste0("  Added column: ", condition_col_name, " for ", condition_name, "\n"))
 }
 
-# Create patient-level condition summary for easy access
+# Create patient-level condition summary
 chronic_derm_patient_summary <- chronic_derm_master[, {
   condition_cols <- grep("^condition_", names(.SD), value = TRUE)
   condition_list <- lapply(condition_cols, function(col) any(get(col)))
@@ -432,13 +426,12 @@ cat("Master datasets created:\n")
 cat("  chronic_derm_master: ", nrow(chronic_derm_master), " encounters\n")
 cat("  chronic_derm_patient_summary: ", nrow(chronic_derm_patient_summary), " patients\n")
 
-# --- PATIENT FLOW TRACKING ---
-cat("\n=== PATIENT FLOW SUMMARY ===\n")
+cat("\n=== PATIENT SUMMARY ===\n")
 cat("1. Total unique patients in full dataset:", uniqueN(result_wide$mrn_deid), "\n")
 cat("2. Total encounters in full dataset:", nrow(result_wide), "\n")
 cat("3. Chronic derm patients with PHQ data (unique):", uniqueN(chronic_derm_cohort$mrn_deid), "\n") 
 cat("4. Chronic derm encounters with PHQ data:", nrow(chronic_derm_cohort), "\n")
-cat("   NOTE: Chronic derm cohort now ONLY includes patients with available PHQ scores\n")
+cat("   Chronic derm cohort now only includes patients with available PHQ scores\n")
 
 chronic_derm_phq_summary <- chronic_derm_master[, .(
   has_any_phq = any(!is.na(phq_score)),
@@ -447,7 +440,7 @@ chronic_derm_phq_summary <- chronic_derm_master[, .(
   max_phq_score = if (any(!is.na(phq_score))) max(phq_score, na.rm = TRUE) else NA_real_
 ), by = mrn_deid]
 
-# Compute worst_severity from max_phq_score (avoids stale phq_severity lookup)
+# Compute worst_severity from max_phq_score
 chronic_derm_phq_summary[, worst_severity := fifelse(is.na(max_phq_score), "Missing",
                                             fifelse(max_phq_score <= 4, "Negative",
                                             fifelse(max_phq_score <= 9, "Mild",
@@ -460,16 +453,16 @@ cat("Chronic derm patients with PHQ9:", sum(chronic_derm_phq_summary$has_phq9), 
 cat("Chronic derm patients with PHQ2 only:", sum(chronic_derm_phq_summary$has_phq2_only), "\n")
 cat("Chronic derm patients with no PHQ data:", sum(!chronic_derm_phq_summary$has_any_phq), "(should be 0 by design)\n")
 
-# VERIFICATION: Check that all chronic derm patients have PHQ data
+#Check  all chronic derm patients have PHQ data
 patients_no_phq <- chronic_derm_phq_summary[has_any_phq == FALSE]
-cat("\n=== VERIFICATION: CHRONIC DERM COHORT PHQ COMPLIANCE ===\n")
+cat("\n===CHRONIC DERM COHORT PHQ ===\n")
 cat("Total chronic derm patients without PHQ data:", nrow(patients_no_phq), "(should be 0)\n")
 
 if(nrow(patients_no_phq) > 0) {
-  cat("ERROR: Found chronic derm patients without PHQ data - this violates inclusion criteria!\n")
+  cat("Found chronic derm patients without PHQ data\n")
   print(head(patients_no_phq, 5))
 } else {
-  cat("✓ SUCCESS: All chronic derm patients have PHQ data as required\n")
+  cat(" All chronic derm patients have PHQ data as required\n")
 }
 
 # PHQ severity distribution in chronic derm cohort
@@ -479,8 +472,6 @@ print(chronic_derm_severity_counts)
 
 data_path <- "Z:/Kucirek/"
 
-# ===== VERIFICATION SYSTEM =====
-cat("\n=== MASTER DATASET VERIFICATION ===\n")
 verify_master_counts <- function() {
   cat("CONDITION COUNT VERIFICATION:\n")
   for (condition_name in names(chronic_condition_icd_codes)) {
@@ -498,13 +489,13 @@ verify_master_counts <- function() {
 }
 verify_master_counts()
 
-#save intermediate files - EXPANDED with master datasets
+#save intermediate files 
 saveRDS(result_wide, file.path(data_path, "result_wide.rds"))
 saveRDS(chronic_derm_cohort, file.path(data_path, "chronic_derm_cohort.rds"))
 saveRDS(patient_phq_summary, file.path(data_path, "patient_phq_summary.rds"))
 saveRDS(chronic_derm_phq_summary, file.path(data_path, "chronic_derm_phq_summary.rds"))
 
-# Create patient_data_for_matching - patient-level dataset with demographic info and chronic derm status
+# Create patient_data_for_matching 
 # First check what demographic columns exist
 cat("Available columns in result_wide:\n")
 cat(paste(names(result_wide), collapse = ", "), "\n")
@@ -517,7 +508,7 @@ patient_data_for_matching <- result_wide[, {
     is_chronic_derm = mrn_deid %in% chronic_derm_patient_summary$mrn_deid
   )
   
-  # Add available demographic columns
+  # Add demographic columns
   if("sex" %in% available_cols) demo_list$sex <- first(na.omit(sex))
   if("race_refined" %in% available_cols) demo_list$race_refined <- first(na.omit(race_refined))
   if("race" %in% available_cols && !"race_refined" %in% available_cols) demo_list$race <- first(na.omit(race))
@@ -529,7 +520,7 @@ patient_data_for_matching <- result_wide[, {
 
 cat("Created patient_data_for_matching with columns:", paste(names(patient_data_for_matching), collapse = ", "), "\n")
 
-# NEW: Save master datasets for consistent use across all files
+# NEW: Save datasets for consistent use across all files
 saveRDS(chronic_derm_master, file.path(data_path, "chronic_derm_master.rds"))
 saveRDS(chronic_derm_patient_summary, file.path(data_path, "chronic_derm_patient_summary.rds"))
 saveRDS(chronic_derm_patient_conditions, file.path(data_path, "chronic_derm_patient_conditions.rds"))
@@ -545,10 +536,44 @@ cat("  chronic_derm_patient_conditions.rds - condition-to-patient mapping\n")
 cat("  condition_patient_counts.rds - verified patient counts per condition\n")
 cat("  patient_data_for_matching.rds - patient demographics for matching/analysis\n")
 
-# Multi-condition patient count (manuscript Results claim: n=79, 1.7%)
 condition_cols <- grep("^condition_", names(chronic_derm_patient_summary), value = TRUE)
 n_conditions_per_patient <- rowSums(chronic_derm_patient_summary[, ..condition_cols])
 cat("Patients with exactly 1 chronic derm condition:", sum(n_conditions_per_patient == 1), "\n")
 cat("Patients with >1 chronic derm condition:", sum(n_conditions_per_patient > 1), 
     "(", round(100 * sum(n_conditions_per_patient > 1) / nrow(chronic_derm_patient_summary), 1), "%)\n")
-```
+
+library(data.table)
+matched_data <- readRDS("Z:/Kucirek/matched_data.rds")
+setDT(matched_data)
+
+cat("\n=== TABLE 1 AFTER MATCHING ===\n")
+cat("\nTotals:\n")
+print(matched_data[, .N, by = is_chronic_derm])
+
+cat("\nSex:\n")
+print(matched_data[, .N, by = .(is_chronic_derm, sex)][order(is_chronic_derm, sex)])
+
+cat("\nRace/Ethnicity:\n")
+print(matched_data[, .N, by = .(is_chronic_derm, race_ethnicity_combined)][order(is_chronic_derm, race_ethnicity_combined)])
+
+cat("\nInsurance (5-cat for matching):\n")
+print(matched_data[, .N, by = .(is_chronic_derm, fin_class)][order(is_chronic_derm, fin_class)])
+
+cat("\nInsurance (4-cat manuscript display: Self-Pay folded into Other):\n")
+matched_data[, fin_display := fcase(
+  fin_class == "Private Payors", "Private",
+  fin_class == "Medicare", "Medicare",
+  fin_class == "Medicaid", "Medicaid",
+  default = "Other"
+)]
+print(matched_data[, .N, by = .(is_chronic_derm, fin_display)][order(is_chronic_derm, fin_display)])
+
+cat("\nAge:\n")
+print(matched_data[, .(mean_age = round(mean(age_at_encounter, na.rm=TRUE), 1),
+                       sd_age = round(sd(age_at_encounter, na.rm=TRUE), 1),
+                       median_age = as.numeric(median(age_at_encounter, na.rm=TRUE)),
+                       n = .N), by = is_chronic_derm])
+
+cat("\nPrior psych:\n")
+print(matched_data[, .N, by = .(is_chronic_derm, has_psych_condition)][order(is_chronic_derm, has_psych_condition)])
+
