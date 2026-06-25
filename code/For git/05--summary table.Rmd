@@ -3,16 +3,6 @@ title: "05: Plots"
 output: html_document
 ---
 
-This script is the fifth and final step in the analysis pipeline. It performs the following actions:
-
-1.  **Loads Cohort Data**: It loads the `result_wide.rds`, `chronic_derm_cohort.rds`, and `derm_clinic_cohort.rds` files created in the previous steps.
-2.  **Generates Plots**: It generates a series of plots to visualize the results of the analyses, including:
-    *   A comparison of PHQ positivity rates between the "Derm Clinic" and "Non-Derm" cohorts.
-    *   A comparison of PHQ positivity rates for various dermatological conditions.
-    *   A plot of dermatological conditions with significantly higher PHQ positivity rates.
-    *   A plot of encounter counts for specific dermatological ICD-10 codes.
-    *   A Sankey diagram showing the change in patient PHQ-2 status after a chronic derm diagnosis.
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
@@ -21,354 +11,123 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r}
 library(data.table)
-library(dplyr)
-library(stringr)
 library(ggplot2)
-library(scales)
-library(RColorBrewer)
-library(networkD3)
-library(htmlwidgets)
 
-# --- Configuration: Set your data path here ---
-data_path <- "Z:/Kucirek/"
+csv_dir <- "C:/Users/dkucirek/Documents/Derm-SRP/csv/"
+fig_dir <- "C:/Users/dkucirek/Documents/Derm-SRP/figures/"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
 
-# --- Load Pre-processed Data ---
-result_wide_all <- readRDS(file.path(data_path, "result_wide.rds"))
-chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
-derm_clinic_cohort <- readRDS(file.path(data_path, "derm_clinic_cohort.rds"))
+fig1_raw <- fread(file.path(csv_dir, "Combined_Cohort_Severity.csv"))
 
-setDT(result_wide_all)
-setDT(chronic_derm_cohort)
-setDT(derm_clinic_cohort)
-```
+# Keep only 4 severity strata + SI; exclude Any Clinical Depression and Continuous PHQ
+fig1_data <- fig1_raw[Analysis %in% c(
+  "Mild (PHQ 5-9)",
+  "Moderate (PHQ 10-14)",
+  "Moderately Severe (PHQ 15-19)",
+  "Severe (PHQ 20-27)",
+  "Suicidal Ideation"
+)]
 
-### Derm vs. Non-Derm Plots
+# Suicidal Ideation on top, Mild on bottom
+fig1_data[, Outcome := factor(Analysis, levels = c(
+  "Mild (PHQ 5-9)",
+  "Moderate (PHQ 10-14)",
+  "Moderately Severe (PHQ 15-19)",
+  "Severe (PHQ 20-27)",
+  "Suicidal Ideation"
+))]
 
-```{r}
-# --- Helper Functions ---
-calculate_phq_positivity_dt <- function(dt) {
-  if (nrow(dt) == 0) return(list(n_patients = 0, phq2_pos_count = 0, phq9_pos_count = 0))
-  phq_summary <- dt[, .(
-    phq2_pos = any((`phq_value_CMS PHQ-2 POS/NEG` == "Positive") | (phq2_manual_posneg == "Positive"), na.rm = TRUE),
-    phq9_pos = any((`phq_value_CMS PHQ-9 POS/NEG` == "Positive") |
-                   (!is.na(`phq_value_num_PHQ-9 Total Score`) & `phq_value_num_PHQ-9 Total Score` >= 10) |
-                   (!is.na(phq9_manual_sum) & phq9_manual_sum >= 10), na.rm = TRUE)
-  ), by = mrn_deid]
-  return(list(
-    n_patients = uniqueN(phq_summary$mrn_deid),
-    phq2_pos_count = sum(phq_summary$phq2_pos, na.rm = TRUE),
-    phq9_pos_count = sum(phq_summary$phq9_pos, na.rm = TRUE)
-  ))
-}
-
-get_p_value <- function(group1_stats, group2_stats, phq_type) {
-  pos1 <- if (phq_type == "PHQ-2") group1_stats$phq2_pos_count else group1_stats$phq9_pos_count
-  neg1 <- group1_stats$n_patients - pos1
-  pos2 <- if (phq_type == "PHQ-2") group2_stats$phq2_pos_count else group2_stats$phq9_pos_count
-  neg2 <- group2_stats$n_patients - pos2
-  mat <- matrix(c(pos1, neg1, pos2, neg2), nrow = 2, byrow = TRUE)
-  if(any(is.na(mat)) || any(mat < 0)) return(NA)
-  test_result <- tryCatch(chisq.test(mat, correct = TRUE), error = function(e) list(p.value = NA))
-  return(test_result$p.value)
-}
-
-significance_stars <- function(p) {
-  case_when(is.na(p) ~ "", p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "")
-}
-
-# --- Define Cohorts and Calculate Rates ---
-non_derm_cohort <- result_wide_all[!mrn_deid %in% unique(derm_clinic_cohort$mrn_deid)]
-
-stats_non_derm <- calculate_phq_positivity_dt(non_derm_cohort)
-stats_derm_clinic <- calculate_phq_positivity_dt(derm_clinic_cohort)
-stats_chronic_derm <- calculate_phq_positivity_dt(chronic_derm_cohort)
-
-plot_df <- data.frame(
-  Cohort = c("Chronic Derm", "Derm Clinic Cohort", "Non-Derm"),
-  N = c(stats_chronic_derm$n_patients, stats_derm_clinic$n_patients, stats_non_derm$n_patients),
-  PHQ2_Rate = c(stats_chronic_derm$phq2_pos_count / stats_chronic_derm$n_patients,
-                stats_derm_clinic$phq2_pos_count / stats_derm_clinic$n_patients,
-                stats_non_derm$phq2_pos_count / stats_non_derm$n_patients),
-  PHQ9_Rate = c(stats_chronic_derm$phq9_pos_count / stats_chronic_derm$n_patients,
-                stats_derm_clinic$phq9_pos_count / stats_derm_clinic$n_patients,
-                stats_non_derm$phq9_pos_count / stats_non_derm$n_patients)
-)
-
-plot_df$PHQ2_Rate_Formatted <- paste0(round(plot_df$PHQ2_Rate * 100, 1), "%")
-plot_df$PHQ9_Rate_Formatted <- paste0(round(plot_df$PHQ9_Rate * 100, 1), "%")
-
-plot_df$p_val_phq2 <- sapply(list(stats_chronic_derm, stats_derm_clinic, stats_non_derm), get_p_value, stats_non_derm, "PHQ-2")
-plot_df$p_val_phq9 <- sapply(list(stats_chronic_derm, stats_derm_clinic, stats_non_derm), get_p_value, stats_non_derm, "PHQ-9")
-
-plot_df$sig_phq2 <- significance_stars(plot_df$p_val_phq2)
-plot_df$sig_phq9 <- significance_stars(plot_df$p_val_phq9)
-
-# --- Generate Plots ---
-create_comparison_plot <- function(data, rate_col, sig_col, title) {
-  rate_col_sym <- sym(rate_col)
-  sig_col_sym <- sym(sig_col)
-  formatted_rate_col_sym <- sym(paste0(rate_col, "_Formatted"))
-
-  data$Cohort <- factor(data$Cohort, levels = c("Non-Derm", "Derm Clinic Cohort", "Chronic Derm"))
-
-  ggplot(data, aes(x = Cohort, y = !!rate_col_sym, fill = Cohort)) +
-    geom_bar(stat = "identity", color = "black", width = 0.7) +
-    geom_text(aes(label = !!formatted_rate_col_sym),
-              vjust = -0.5,
-              size = 5, fontface = "bold", color = "black") +
-    geom_text(aes(label = !!sig_col_sym, y = !!rate_col_sym + 0.03),
-              size = 8, color = "black") +
-    labs(title = title, subtitle = "Compared to Non-Dermatology Patients", x = NULL, y = "Positive Screening Rate") +
-    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
-                       expand = expansion(mult = c(0, 0.25))) +
-    scale_fill_manual(values = c("Chronic Derm" = "#D55E00", "Derm Clinic Cohort" = "#009E73", "Non-Derm" = "#56B4E9")) +
-    theme_minimal(base_size = 16) +
-    theme(
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
-      plot.subtitle = element_text(hjust = 0.5, size = 14, color = "gray30"),
-      legend.position = "none",
-      axis.text.x = element_text(face = "bold", size = 14),
-      axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
-      plot.margin = margin(1, 1, 1, 1, "cm")
-    )
-}
-
-plot_phq2 <- create_comparison_plot(plot_df, "PHQ2_Rate", "sig_phq2", "Comparison of PHQ-2 Positivity Rates Across Patient Cohorts")
-print(plot_phq2)
-
-plot_phq9 <- create_comparison_plot(plot_df, "PHQ9_Rate", "sig_phq9", "Comparison of PHQ-9 Positivity Rates Across Patient Cohorts")
-print(plot_phq9)
-```
-
-### Derm Conditions Screening Plots
-
-```{r}
-# --- Define Chronic Dermatological Conditions ---
-chronic_condition_terms <- list(
-  "Scarring Alopecia" = c("lichen planopilaris", "lichen plano-pilaris", "central centrifugal cicatricial alopecia", "cicatricial alopecia", "Alopecia, scarring", "Scarring alopecia"),
-  "Acne" = c("acne vulgaris", "other acne", "acne, unspecified acne type", "nodulocystic acne", "cystic acne", "acne keloidalis nuchae", "cystic acne vulgaris", "inflammatory acne"),
-  "Hidradenitis Suppurativa" = "hidradenitis suppurativa",
-  "Rosacea" = "rosacea",
-  "Vitiligo" = "vitiligo",
-  "Atopic Dermatitis" = c("intrinsic atopic dermatitis", "atopic dermatitis, unspecified type", "other atopic dermatitis", "atopic dermatitis"),
-  "Psoriasis" = "psoriasis",
-  "Lupus Erythematosus" = "lupus erythematosus",
-  "Alopecia Areata" = c("Alopecia areata", "Alopecia areata totalis")
-)
-
-# --- Create Cohorts, Calculate Rates and P-values ---
-non_chronic_cohort <- derm_clinic_cohort[!mrn_deid %in% unique(chronic_derm_cohort$mrn_deid)]
-
-stats_non_chronic <- calculate_phq_positivity_dt(non_chronic_cohort)
-
-plot_data_list <- lapply(names(chronic_condition_terms), function(name) {
-  terms <- chronic_condition_terms[[name]]
-  if (length(terms) > 1) {
-    mrns <- chronic_derm_cohort[tolower(icd_diagnosis) %in% tolower(terms), unique(mrn_deid)]
-  } else {
-    mrns <- chronic_derm_cohort[str_detect(tolower(icd_diagnosis), tolower(terms)), unique(mrn_deid)]
-  }
-  cohort <- chronic_derm_cohort[mrn_deid %in% mrns]
-  stats <- calculate_phq_positivity_dt(cohort)
-  
-  if (stats$n_patients == 0) return(NULL)
-  
-  data.frame(
-    Cohort = name,
-    N = stats$n_patients,
-    PHQ2_Rate = stats$phq2_pos_count / stats$n_patients,
-    PHQ9_Rate = stats$phq9_pos_count / stats$n_patients,
-    p_val_phq2_vs_nc = get_p_value(stats, stats_non_chronic, "PHQ-2"),
-    p_val_phq9_vs_nc = get_p_value(stats, stats_non_chronic, "PHQ-9")
+fig1 <- ggplot(fig1_data, aes(y = Outcome, x = Estimate)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_errorbar(aes(xmin = CI_Lower, xmax = CI_Upper),
+                width = 0.15, linewidth = 0.8, color = "#1F4E79",
+                orientation = "y") +
+  geom_point(shape = 18, size = 4, color = "#1F4E79") +
+  scale_x_continuous(
+    name   = "Risk Ratio (95% CI)",
+    limits = c(0.9, 2.2),
+    breaks = c(1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
+  ) +
+  scale_y_discrete(name = "") +
+  labs(
+    title    = "Figure 1. Depression Symptom Risk by\nPHQ 9 Score in Dermatologic Patients vs Matched Controls",
+    subtitle = "4,535 cohort patients vs 88,668 propensity score matched controls"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle      = element_text(size = 10, hjust = 0.5, color = "gray40"),
+    axis.title.x       = element_text(face = "bold"),
+    axis.text          = element_text(color = "black"),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.4),
+    plot.margin        = margin(20, 30, 20, 20)
   )
-})
 
-individual_rates_df <- bind_rows(plot_data_list)
+print(fig1)
+ggsave(file.path(fig_dir, "Figure1_PHQ_Severity_Forest.png"),
+       fig1, width = 8, height = 5, dpi = 300)
+cat("Figure 1 saved.\n")
 
-# --- Generate Plots ---
-create_plot <- function(data, rate_col, p_val_col, title, ref_line_rate) {
-  rate_col_sym <- sym(rate_col)
-  p_val_col_sym <- sym(p_val_col)
-  
-  data <- data %>% mutate(sig = significance_stars(!!p_val_col_sym))
-  
-  ggplot(data, aes(x = reorder(Cohort, !!rate_col_sym), y = !!rate_col_sym, fill = !!rate_col_sym)) +
-    geom_bar(stat = "identity", color = "black", width = 0.7) +
-    geom_text(aes(label = paste0(round(!!rate_col_sym * 100, 1), "%")), hjust = 1.2, size = 3.5, color = "white") +
-    geom_text(aes(label = sig), hjust = -0.3, size = 5, color = "black") +
-    geom_hline(aes(yintercept = ref_line_rate, linetype = "Non-Chronic Derm Rate"), color = "firebrick", size = 0.8) +
-    scale_fill_gradient(low = "#56B4E9", high = "#0072B2") +
-    scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.15))) +
-    scale_linetype_manual(name = "", values = c("Non-Chronic Derm Rate" = "dashed")) +
-    coord_flip() +
-    labs(
-      title = title,
-      subtitle = "Compared to Non-Chronic Dermatology Patient Rate",
-      x = NULL, 
-      y = "Positive Screening Rate"
-    ) +
-    theme_minimal(base_size = 14) +
-    theme(
-      plot.title = element_text(hjust = 0.5, size = 18),
-      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
-      axis.text.x = element_text(size = 10),
-      axis.text.y = element_text(size = 10),
-      axis.title.x = element_text(size = 12, margin = margin(t = 10)),
-      legend.position = "bottom",
-      panel.grid.major.y = element_blank(),
-      panel.grid.minor.y = element_blank(),
-      panel.grid.major.x = element_line(color = "gray90", linetype = "dotted"),
-      plot.margin = margin(1, 1, 1, 1, "cm")
-    ) +
-    guides(fill = "none")
-}
+# ── FIGURE 2 ─────────────────────────────────────────────────────────────────
 
-phq2_plot <- create_plot(individual_rates_df, "PHQ2_Rate", "p_val_phq2_vs_nc", "PHQ-2 Positivity by Chronic Condition", stats_non_chronic$phq2_pos_count / stats_non_chronic$n_patients)
-print(phq2_plot)
+fig2_raw <- fread(file.path(csv_dir, "All_Condition_Results.csv"))
 
-phq9_plot <- create_plot(individual_rates_df, "PHQ9_Rate", "p_val_phq9_vs_nc", "PHQ-9 Positivity by Chronic Condition", stats_non_chronic$phq9_pos_count / stats_non_chronic$n_patients)
-print(phq9_plot)
-```
+fig2_data <- fig2_raw[, .(
+  Condition   = Condition,
+  RR          = AnyClin_RR,
+  CI_lo       = AnyClin_CI_lo,
+  CI_hi       = AnyClin_CI_hi,
+  Significant = AnyClin_Sig
+)]
 
-### Significant Derm Conditions Plots
-```{r}
-# --- Filter for Significance ---
-significant_phq2 <- individual_rates_df %>%
-  filter(p_val_phq2_vs_nc < 0.05 & PHQ2_Rate > (stats_non_chronic$phq2_pos_count / stats_non_chronic$n_patients)) %>%
-  mutate(sig = significance_stars(p_val_phq2_vs_nc))
+# Alphabetical order: A-Z bottom to top
+fig2_data[, Condition := factor(Condition,
+  levels = rev(sort(unique(as.character(Condition)))))]
 
-significant_phq9 <- individual_rates_df %>%
-  filter(p_val_phq9_vs_nc < 0.05 & PHQ9_Rate > (stats_non_chronic$phq9_pos_count / stats_non_chronic$n_patients)) %>%
-  mutate(sig = significance_stars(p_val_phq9_vs_nc))
+cat("Condition factor levels (bottom to top):\n")
+print(levels(fig2_data$Condition))
 
-# --- Generate Plots for Significant Conditions ---
-create_significant_plot <- function(data, rate_col, sig_col, title, ref_line_rate) {
-  rate_col_sym <- sym(rate_col)
-  sig_col_sym <- sym(sig_col)
-  
-  if (nrow(data) == 0) {
-    return(ggplot() + labs(title = title, subtitle = "No conditions with significantly higher rates found.") + theme_minimal())
-  }
-  
-  ggplot(data, aes(x = reorder(Cohort, !!rate_col_sym), y = !!rate_col_sym, fill = Cohort)) +
-    geom_bar(stat = "identity", color = "black", width = 0.7) +
-    geom_text(aes(label = paste0(round(!!rate_col_sym * 100, 1), "%")), hjust = 1.2, color = "white", size = 3.5) +
-    geom_text(aes(label = !!sig_col_sym), hjust = -0.3, size = 5, color = "black") +
-    geom_hline(aes(yintercept = ref_line_rate, linetype = "Non-Derm Rate"), color = "firebrick", size = 0.8) +
-    scale_fill_brewer(palette = "viridis") +
-    scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.15))) +
-    scale_linetype_manual(name = "", values = c("Non-Derm Rate" = "dashed")) +
-    coord_flip() +
-    labs(
-      title = title,
-      subtitle = "Positivity rates significantly higher than the non-dermatology patient rate",
-      x = NULL, 
-      y = "Positive Screening Rate"
-    ) +
-    theme_minimal(base_size = 14) +
-    theme(
-      plot.title = element_text(hjust = 0.5, size = 18),
-      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
-      axis.text = element_text(size = 10),
-      axis.title.x = element_text(size = 12, margin = margin(t = 10)),
-      legend.position = "none",
-      panel.grid.major.y = element_blank(),
-      panel.grid.minor.y = element_blank(),
-      panel.grid.major.x = element_line(color = "gray90", linetype = "dotted"),
-      plot.margin = margin(t = 1.5, r = 1, b = 1, l = 1, unit = "cm")
-    )
-}
-
-plot_sig_phq2 <- create_significant_plot(significant_phq2, "PHQ2_Rate", "sig", "Dermatologic Conditions with Significantly Higher PHQ-2 Positivity", stats_non_derm$phq2_pos_count / stats_non_derm$n_patients)
-print(plot_sig_phq2)
-
-plot_sig_phq9 <- create_significant_plot(significant_phq9, "PHQ9_Rate", "sig", "Dermatologic Conditions with Significantly Higher PHQ-9 Positivity", stats_non_derm$phq9_pos_count / stats_non_derm$n_patients)
-print(plot_sig_phq9)
-```
-
-
-### ICD Counts Plot
-
-I would also like number of patients 
-
-```{r}
-# --- Load Data ---
-encounters_data <- fread(file.path(data_path, "specific_icd_encounters.csv"))
-
-# --- Prepare Data for Plotting ---
-plot_data <- encounters_data[, .N, by = icd_category]
-
-# --- Create the Bar Chart ---
-if (nrow(plot_data) > 0) {
-  icd_counts_plot <- ggplot(plot_data, aes(x = reorder(icd_category, N), y = N)) +
-    geom_bar(stat = "identity", fill = "#0072B2", width = 0.7) +
-    coord_flip() +
-    geom_text(aes(label = N), hjust = -0.2, size = 3.5, color = "black") +
-    labs(
-      title = "Encounter Counts for Specific Dermatological ICD-10 Codes",
-      subtitle = "Total number of encounters recorded for each condition category",
-      x = "ICD-10 Code Category",
-      y = "Number of Encounters"
-    ) +
-    theme_minimal(base_size = 14) +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
-      axis.title.x = element_text(face = "bold"),
-      axis.title.y = element_text(face = "bold"),
-      panel.grid.major.y = element_blank(),
-      panel.grid.minor.x = element_blank()
-    )
-
-  print(icd_counts_plot)
-}
-```
-
-### Sankey Plot
-
-```{r}
-# --- Load Data ---
-patient_summary <- fread(file.path(data_path, "longitudinal_patient_phq_change.csv"))
-
-# --- Prepare Data for the Sankey Diagram ---
-links <- patient_summary %>%
-  group_by(ever_positive_pre, ever_positive_post) %>%
-  summarise(value = n(), .groups = 'drop') %>%
-  as.data.table()
-
-nodes <- data.frame(name = c(
-  "Pre-Chronic Negative", 
-  "Pre-Chronic Positive", 
-  "Post-Chronic Negative", 
-  "Post-Chronic Positive"
-))
-
-links$source <- ifelse(links$ever_positive_pre == FALSE, 0, 1)
-links$target <- ifelse(links$ever_positive_post == FALSE, 2, 3)
-
-# --- Create the Sankey Diagram ---
-my_color <- 'd3.scaleOrdinal().domain(["Pre-Chronic Negative", "Pre-Chronic Positive", "Post-Chronic Negative", "Post-Chronic Positive"]).range(["#0072B2", "#D55E00", "#0072B2", "#D55E00"])'
-
-sankey_plot <- sankeyNetwork(
-  Links = links,
-  Nodes = nodes,
-  Source = "source",
-  Target = "target",
-  Value = "value",
-  NodeID = "name",
-  units = "Patients",
-  fontSize = 14,
-  nodeWidth = 30,
-  colourScale = my_color
-)
-
-sankey_plot <- htmlwidgets::prependContent(
-  sankey_plot, 
-  htmltools::tags$h2(
-    style = "font-family: Arial, sans-serif; text-align: center;", 
-    "Change in Patient PHQ-2 Status After Chronic Derm Diagnosis"
+fig2 <- ggplot(fig2_data, aes(y = Condition, x = RR)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_errorbar(aes(xmin = CI_lo, xmax = CI_hi, color = Significant),
+                width = 0.2, linewidth = 0.8,
+                orientation = "y") +
+  geom_point(aes(color = Significant, shape = Significant), size = 4) +
+  scale_color_manual(
+    values = c("TRUE" = "#1F4E79", "FALSE" = "#7F7F7F"),
+    labels = c("TRUE" = "Yes", "FALSE" = "No"),
+    name   = "Significance"
+  ) +
+  scale_shape_manual(
+    values = c("TRUE" = 18, "FALSE" = 18),
+    labels = c("TRUE" = "Yes", "FALSE" = "No"),
+    name   = "Significance"
+  ) +
+  scale_x_continuous(
+    name   = "Risk Ratio (95% CI)",
+    limits = c(0.2, 3.2),
+    breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+  ) +
+  scale_y_discrete(name = "") +
+  labs(
+    title    = "Figure 2. Clinically Significant Depression Symptom Risk by\nDermatologic Condition",
+    subtitle = "Nine dermatologic conditions vs individually matched controls."
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle      = element_text(size = 10, hjust = 0.5, color = "gray40"),
+    axis.title.x       = element_text(face = "bold"),
+    axis.text          = element_text(color = "black"),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.4),
+    legend.position    = "bottom",
+    legend.title       = element_text(size = 10, face = "bold"),
+    legend.text        = element_text(size = 9),
+    plot.margin        = margin(20, 30, 20, 20)
   )
-)
 
-print(sankey_plot)
+print(fig2)
+ggsave(file.path(fig_dir, "Figure2_Condition_Forest.png"),
+       fig2, width = 8, height = 6, dpi = 300)
+cat("Figure 2 saved.\n")
 ```
