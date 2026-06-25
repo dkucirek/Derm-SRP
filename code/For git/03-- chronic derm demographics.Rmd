@@ -1183,7 +1183,7 @@ if(length(subclinical_pairwise_results) > 0) {
   # Only significant results
   significant_results <- subclinical_pairwise_results[sapply(subclinical_pairwise_results, function(x) x$significant)]
   
-  # Sort by p-value (most significant first)
+  # Sort by p-value 
   if(length(significant_results) > 0) {
     p_values <- sapply(significant_results, function(x) {
       p_str <- x$P_Value
@@ -1241,7 +1241,7 @@ if(length(subclinical_pairwise_results) > 0) {
 }
 ```
 
-## Save All Tables as PNG Files
+## Save all tables as PNG 
 
 ```{r}
 # Save all tables generated in this file as PNG files
@@ -1307,10 +1307,9 @@ if (exists("subclinical_condition_table")) {
 
 cat("File 03 table saving complete.\n")
 
-# ===== ACTION ITEM 6: GENERATE SUPPLEMENTARY MATERIAL =====
 cat("\n=== GENERATING SUPPLEMENTARY TABLES FOR ALL PAIRWISE COMPARISONS ===\n")
 
-# Generate comprehensive supplementary tables with ALL comparisons (significant and non-significant)
+# Generate comprehensive supplementary tables with all comparisons (significant and non-significant)
 if(exists("clinical_pairwise_results") && length(clinical_pairwise_results) > 0) {
   
   cat("Found", length(clinical_pairwise_results), "clinical pairwise results\n")
@@ -1328,7 +1327,7 @@ if(exists("clinical_pairwise_results") && length(clinical_pairwise_results) > 0)
       stringsAsFactors = FALSE
     )
     
-    # Add significance indicator with safe conversion
+    # Add significance indicator 
     all_clinical_results_df$Significant <- ifelse(
       all_clinical_results_df$P_Value == "<0.001" | 
       suppressWarnings(!is.na(as.numeric(gsub("<", "", all_clinical_results_df$P_Value))) & 
@@ -1417,7 +1416,7 @@ if(exists("clinical_pairwise_results") && length(clinical_pairwise_results) > 0)
   cat("No clinical pairwise results available for supplementary table\n")
 }
 
-# Generate Supplementary Table S5 for subclinical comparisons if they exist
+# Supplementary Table S5 for subclinical comparisons if they exist
 if(exists("subclinical_pairwise_results") && length(subclinical_pairwise_results) > 0) {
   
   cat("Found", length(subclinical_pairwise_results), "subclinical pairwise results\n")
@@ -1524,7 +1523,6 @@ print(as.data.frame(depression_summary))
 print(as.data.frame(demo_summary))
 print(as.data.frame(condition_summary))
 
-# For the pairwise that printed NULL — check what's actually there:
 length(clinical_pairwise_results)
 sapply(clinical_pairwise_results, function(x) x$P_Value)
 sapply(clinical_pairwise_results, function(x) x$significant)
