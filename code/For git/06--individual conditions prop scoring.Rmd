@@ -67,7 +67,7 @@ patient_data <- patient_data[sex != "Unknown" & !is.na(race_ethnicity_combined)]
 cat("Data loaded\n")
 ```
 
-## Prep: Build Encounter-Level Flags Required Downstream
+## Prep
 
 ```{r prep}
 # Encounter-level any-clinical-depression flag (PHQ-9 >= 10).
@@ -77,7 +77,7 @@ cat("Data loaded\n")
 # describe their symptom severity").
 result_wide[, phq_any_clinical_depression := !is.na(phq_score) & phq_score >= 10]
 
-# Suicidal ideation from PHQ-9 Item 9 (>= 1 = endorsed)
+# Suicidal ideation
 si_col <- grep("thoughts.*dead|thoughts.*hurting", names(result_wide),
                value = TRUE, ignore.case = TRUE)
 if (length(si_col) > 0) {
@@ -108,7 +108,7 @@ chronic_icd <- list(
 )
 ```
 
-## Match Each Condition
+## Matching conditions
 
 ```{r matching}
 # Single seed before the loop — each condition's matchit gets a different but
@@ -146,7 +146,7 @@ for (cond in names(chronic_icd)) {
 cat("\n=== Processed", length(condition_cohorts), "conditions ===\n")
 ```
 
-## Analyze Each Condition
+## Analyze conditions
 
 ```{r analyze}
 results <- data.table()
@@ -158,9 +158,9 @@ for (cond in names(condition_cohorts)) {
   ctrl_mrns <- matched[treat == 0, mrn_deid]
   
   # Patient-level aggregation: max PHQ score, any clinical depression, SI.
-  # Severity strata (mild/moderate/mod-severe/severe) are derived from max_phq
-  # AFTER aggregation, ensuring mutual exclusivity per Methods.
-  agg_outcomes <- function(mrns, grp) {
+  # Severity (mild/moderate/mod-severe/severe) from max_phq
+
+agg_outcomes <- function(mrns, grp) {
     phq <- result_wide[mrn_deid %in% mrns]
     out <- phq[, .(
       max_phq = max(phq_score, na.rm = TRUE),
@@ -169,7 +169,7 @@ for (cond in names(condition_cohorts)) {
     ), by = mrn_deid]
     out[is.infinite(max_phq), max_phq := NA]
     
-    # Mutually exclusive severity strata, assigned by patient's WORST score
+    # Mutually exclusive severity, assigned by patient's worst score
     out[, `:=`(
       mild       = !is.na(max_phq) & max_phq >= 5  & max_phq < 10,
       moderate   = !is.na(max_phq) & max_phq >= 10 & max_phq < 15,
@@ -195,7 +195,7 @@ for (cond in names(condition_cohorts)) {
   n_case <- nrow(case_out)
   n_ctrl <- nrow(ctrl_out)
   
-  # RR calculations - mutually exclusive severity strata
+  # RR  - mutually exclusive
   mild_rr <- get_rr(combined, "mild_num", "group")
   mod_rr  <- get_rr(combined, "moderate_num", "group")
   ms_rr   <- get_rr(combined, "mod_severe_num", "group")
@@ -249,7 +249,7 @@ for (cond in names(condition_cohorts)) {
     AnyClin_ctrl_pct = round(sum(ctrl_out$any_clinical_depression) / n_ctrl * 100, 1),
     AnyClin_RR = any_clinical_rr$rr, AnyClin_CI_lo = any_clinical_rr$ci_lo, 
     AnyClin_CI_hi = any_clinical_rr$ci_hi, AnyClin_P = any_clinical_rr$p, AnyClin_RD = rd,
-    # Suicidal Ideation
+    # SI
     SI_n = sum(case_out$si), SI_pct = round(sum(case_out$si) / n_case * 100, 1),
     SI_ctrl_n = sum(ctrl_out$si), SI_ctrl_pct = round(sum(ctrl_out$si) / n_ctrl * 100, 1),
     SI_RR = si_rr$rr, SI_CI_lo = si_rr$ci_lo, SI_CI_hi = si_rr$ci_hi, SI_P = si_rr$p,
@@ -262,7 +262,7 @@ for (cond in names(condition_cohorts)) {
   ))
 }
 
-# Holm's correction across the 9 conditions per Methods
+# Holm's correction
 results[, `:=`(
   Mild_P_Adj    = p.adjust(Mild_P, method = "holm"),
   Mod_P_Adj     = p.adjust(Mod_P, method = "holm"),
@@ -283,7 +283,7 @@ results[, `:=`(
   PHQ_Sig     = PHQ_P_Adj < 0.05
 )]
 
-cat("\n=== RESULTS (Holm-corrected significance) ===\n")
+cat("\n=== Results (Holm-corrected significance) ===\n")
 cat("Mild (5-9) significant:", sum(results$Mild_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 cat("Moderate (10-14) significant:", sum(results$Mod_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 cat("Mod-Severe (15-19) significant:", sum(results$MS_Sig, na.rm = TRUE), "/", nrow(results), "\n")
@@ -293,13 +293,12 @@ cat("SI significant:", sum(results$SI_Sig, na.rm = TRUE), "/", nrow(results), "\
 cat("Continuous PHQ significant:", sum(results$PHQ_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 ```
 
-## Pairwise Comparisons (Tukey's)
+## Pairwise comparisons (Tukey's)
 
 ```{r pairwise}
-cat("\n=== PAIRWISE COMPARISONS (Any Clinical Depression) ===\n")
+cat("\n=== Pairwise Comparisons (Any Clinical Depression) ===\n")
 
-# Build patient-level any-clinical-depression flag PER CONDITION using max-score logic
-# (consistent with the per-condition aggregation above)
+# patient-level any clinical depression flag by condition
 all_cond <- rbindlist(lapply(names(condition_cohorts), function(cond) {
   mrns <- condition_cohorts[[cond]][treat == 1, mrn_deid]
   phq  <- result_wide[mrn_deid %in% mrns]
@@ -330,10 +329,10 @@ tryCatch({
 }, error = function(e) cat("Error:", e$message, "\n"))
 ```
 
-## Tables
+# Tables
 
 ```{r tables}
-# Table 2: Depression Severity by Condition (Mutually Exclusive)
+# Table 2: Depression severity by condition (mutually exclusive)
 table2 <- results[, .(
   Condition, N = N_Case,
   `Mild 5-9 n(%)`     = paste0(Mild_n, " (", Mild_pct, ")"),
@@ -351,7 +350,7 @@ print(table2_gt)
 # gtsave disabled — Chrome not available on WinStats
 # gtsave(table2_gt, file.path(figures_dir, "Table2_Severity.png"))
 
-# Table 3: Depression Severity RRs
+# Table 3: Depression severity RRs
 table3 <- results[, .(
   Condition,
   `Mild RR`    = Mild_RR, `Mild P`    = ifelse(Mild_Sig, paste0(format_p(Mild_P), "*"),    format_p(Mild_P)),
@@ -368,7 +367,7 @@ table3_gt <- table3 |> gt() |>
 print(table3_gt)
 # gtsave(table3_gt, file.path(figures_dir, "Table3_Severity_RR.png"))
 
-# Table 4: Any Clinical Depression (PHQ >= 10)
+# Table 4: Any clinical depression (PHQ >= 10)
 table4 <- results[, .(
   Condition,
   `Cases n (%)`     = paste0(AnyClin_n, " (", AnyClin_pct, ")"),
@@ -386,7 +385,7 @@ table4_gt <- table4 |> gt() |>
 print(table4_gt)
 # gtsave(table4_gt, file.path(figures_dir, "Table4_AnyClinicalDepression.png"))
 
-# Table 5: Suicidal Ideation
+# Table 5: SI
 table5 <- results[, .(
   Condition,
   `Cases n (%)`    = paste0(SI_n, " (", SI_pct, ")"),
@@ -477,7 +476,7 @@ if (nrow(sig_results) > 0) {
 }
 ```
 
-## Save
+# Save
 
 ```{r save}
 fwrite(results, file.path(csv_dir, "All_Condition_Results.csv"))
