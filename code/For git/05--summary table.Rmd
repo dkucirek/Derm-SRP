@@ -19,7 +19,6 @@ if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
 
 fig1_raw <- fread(file.path(csv_dir, "Combined_Cohort_Severity.csv"))
 
-# Keep only 4 severity strata + SI; exclude Any Clinical Depression and Continuous PHQ
 fig1_data <- fig1_raw[Analysis %in% c(
   "Mild (PHQ 5-9)",
   "Moderate (PHQ 10-14)",
@@ -50,7 +49,7 @@ fig1 <- ggplot(fig1_data, aes(y = Outcome, x = Estimate)) +
   ) +
   scale_y_discrete(name = "") +
   labs(
-    title    = "Figure 1. Depression Symptom Risk by\nPHQ 9 Score in Dermatologic Patients vs Matched Controls",
+    title    = "Figure 1. Depression Symptom Risk by PHQ 9 Score in Dermatologic Patients vs Matched Controls",
     subtitle = "4,535 cohort patients vs 88,668 propensity score matched controls"
   ) +
   theme_classic(base_size = 12) +
@@ -68,8 +67,7 @@ ggsave(file.path(fig_dir, "Figure1_PHQ_Severity_Forest.png"),
        fig1, width = 8, height = 5, dpi = 300)
 cat("Figure 1 saved.\n")
 
-# ── FIGURE 2 ─────────────────────────────────────────────────────────────────
-
+# Figure 2 
 fig2_raw <- fread(file.path(csv_dir, "All_Condition_Results.csv"))
 
 fig2_data <- fig2_raw[, .(
@@ -80,7 +78,7 @@ fig2_data <- fig2_raw[, .(
   Significant = AnyClin_Sig
 )]
 
-# Alphabetical order: A-Z bottom to top
+# Alphabetical order
 fig2_data[, Condition := factor(Condition,
   levels = rev(sort(unique(as.character(Condition)))))]
 
