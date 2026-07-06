@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-### Load Libraries and Data
+### Load 
 
 ```{r}
 library(data.table)
@@ -23,7 +23,7 @@ data_path <- "Z:/Kucirek/"
 result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
 setDT(result_wide)
 
-#check that required PHQ columns from 01 exist
+#check that required PHQ columns exist
 required_cols <- c("phq_score", "phq_type_used", "phq_severity", "phq_clinical", "phq_subclinical")
 missing_cols <- setdiff(required_cols, names(result_wide))
 
@@ -44,7 +44,7 @@ result_info <- unique(result_wide[, .(mrn_deid, age_at_encounter, fin_class, rac
 result_info[, fin_class := str_to_title(fin_class)]
 result_info[fin_class == "Comercial", fin_class := "Commercial"]
 
-# combine Blue Cross/Blue Shield with Private Payors
+# combine Blue Cross/Blue Shield with pp
 result_info[fin_class %in% c("Blue Cross/Blue Shield", "Private Payors"), fin_class := "Private Payors"]
 
 # put small insurance classes into 'other'
@@ -74,8 +74,7 @@ result_info[, race_refined := fcase(
   default = "Other"
 )]
 
-# Combined race/ethnicity per manuscript Table 1 categories:
-# Non-Hispanic White, Non-Hispanic Black, Asian, Hispanic, Other, Declined/NA
+# Combined race/ethnicity as Non-Hispanic White, Non-Hispanic Black, Asian, Hispanic, Other, Declined/NA
 hispanic_values <- c("Hispanic or Latino",
                      "Mexican, Mexican American, or Chicano/a",
                      "Puerto Rican", "Cuban",
@@ -121,8 +120,8 @@ if (length(chronic_derm_mrns) == 0) {
   warning("No chronic derm patients found in loaded cohort - check File 01 processing!")
 }
 
-# Create final dataset: chronic derm patients (already have PHQ data by inclusion criteria) with complete demographic data
-chronic_derm_with_phq <- chronic_derm_mrns  # All chronic derm patients now have PHQ data by design
+# Create final dataset, chronic derm patients with complete demographic data
+chronic_derm_with_phq <- chronic_derm_mrns  # All chronic derm patients have PHQ data
 cat("Chronic derm patients with PHQ data:", length(chronic_derm_with_phq), "(100% by File 01 inclusion criteria)\n")
 
 patient_data_for_matching <- result_info[, .(mrn_deid, age_at_encounter, sex, race_refined, ethnic_refined, race_ethnicity_combined, fin_class)]
@@ -159,13 +158,11 @@ first_derm_dates <- chronic_derm_cohort[, .(first_chronic_derm_visit = min(enc_d
 patient_first_visits <- merge(first_psych_dates, first_derm_dates, by = "mrn_deid", all.x = TRUE, all.y = TRUE)
 
 # define has_psych_condition based on timing
-# For chronic derm patients: needs behavioral care visit before chronic derm diagnosis
-# For control patients: any psychiatric visit counts 
+# For chronic derm patients, needs behavioral care visit before chronic derm diagnosis
 patient_first_visits[, has_psych_condition_timed := ifelse(
   !is.na(first_chronic_derm_visit), 
-  # Chronic derm patients: psych visit must be before derm visit
+  # psych visit before derm visit
   !is.na(first_psych_visit) & (first_psych_visit < first_chronic_derm_visit),
-  # Control patients: any psych visit counts
   !is.na(first_psych_visit)
 )]
 patient_first_visits[is.na(has_psych_condition_timed), has_psych_condition_timed := FALSE]
@@ -202,7 +199,7 @@ complete_data_patients <- patient_data_for_matching[!is.na(age_at_encounter) & !
                                                    !is.na(fin_class) & !is.na(num_visits) & 
                                                    !is.na(has_psych_condition)]
 
-# For chronic derm patients: only keep those with complete data
+# For chronic derm patients, only keep those with complete data
 chronic_derm_final <- complete_data_patients[is_chronic_derm == TRUE, mrn_deid]
 cat("Final chronic derm patients (complete covariates, PHQ guaranteed by File 01):", length(chronic_derm_final), "\n")
 
@@ -220,7 +217,7 @@ for (col_name in c("age_at_encounter", "sex", "race_refined", "ethnic_refined", 
   }
 }
 
-# verify race/ethnicity distribution 1
+# verify race/ethnicity distribution 
 cat("\nRace/ethnicity by group :\n")
 race_eth_check <- patient_data_for_matching[, .N, 
                                               by = .(race_ethnicity_combined, is_chronic_derm)][
@@ -235,17 +232,12 @@ cat(paste("Prepared data for propensity score matching saved to:", output_prepar
 
 cat("Summary of prepared data:\n")
 print(patient_data_for_matching[, .N, by = is_chronic_derm])
-cat("VERIFICATION: Chronic derm patients in saved file:", sum(patient_data_for_matching$is_chronic_derm), "\n")
+cat("Chronic derm patients in saved file:", sum(patient_data_for_matching$is_chronic_derm), "\n")
 ```
 
-## Unmatched Cohort Comparison
+## Unmatched cohort comparison
 
 ```{r unmatched_comparison}
-# Compare chronic derm cohort vs all eligible (unmatched) controls on
-# demographic variables. These produce the P values reported in the manuscript
-# Results paragraph: "more female (77% vs 62%; p < .001), Non-Hispanic Black
-# (45% vs 33%; p < .001), younger (43 [17] vs 51 [19] years, p < .001),
-# privately insured (66% vs 60%; p < .001)".
 
 cat("\n========================================\n")
 cat("UNMATCHED COHORT DEMOGRAPHIC COMPARISON\n")
