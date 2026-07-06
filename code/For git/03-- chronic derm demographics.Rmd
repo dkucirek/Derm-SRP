@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 ```
 
-### Load Libraries and Data
+# Load libraries and data
 
 ```{r}
 library(data.table)
@@ -15,7 +15,7 @@ library(dplyr)
 library(gt)
 library(stringr)
 
-# Enhanced p-value formatting for standardized reporting
+# p-value formatting 
 format_pvalue <- function(p) {
   if (is.na(p)) return("—")
   if (p < 0.001) return("<0.001")
@@ -26,7 +26,6 @@ format_pvalue <- function(p) {
 
 data_path <- "Z:/Kucirek/"
 
-# Load MASTER datasets from File 01 - SINGLE SOURCE OF TRUTH
 chronic_derm_master <- readRDS(file.path(data_path, "chronic_derm_master.rds"))
 chronic_derm_patient_summary <- readRDS(file.path(data_path, "chronic_derm_patient_summary.rds"))
 chronic_derm_patient_conditions <- readRDS(file.path(data_path, "chronic_derm_patient_conditions.rds"))
@@ -34,7 +33,7 @@ condition_patient_counts <- readRDS(file.path(data_path, "condition_patient_coun
 condition_column_mapping <- readRDS(file.path(data_path, "condition_column_mapping.rds"))
 result_info <- readRDS(file.path(data_path, "result_info.rds"))
 
-# Load legacy files for compatibility (but use master datasets for analysis)
+# Load old files (but use master datasets)
 result_wide <- readRDS(file.path(data_path, "result_wide.rds"))
 chronic_derm_cohort <- readRDS(file.path(data_path, "chronic_derm_cohort.rds"))
 
@@ -44,7 +43,7 @@ setDT(result_wide)
 setDT(chronic_derm_cohort)
 setDT(result_info)
 
-# Check that required PHQ columns from File 01 exist
+# Check that PHQ columns from file 1 exist
 required_cols <- c("phq_score", "phq_clinical", "phq_subclinical", "phq_type_used")
 missing_cols <- setdiff(required_cols, names(result_wide))
 
@@ -54,9 +53,8 @@ if (length(missing_cols) > 0) {
              "\nPlease re-run '01_joining_and_cohort_definition.Rmd' first."))
 }
 
-cat("=== BASIC CHRONIC DERMATOLOGY COHORT ANALYSIS ===\n")
+cat(" BASIC CHRONIC DERMATOLOGY COHORT ANALYSIS \n")
 
-# MASTER DATASET VERIFICATION
 if (!exists("chronic_derm_master") || nrow(chronic_derm_master) == 0) {
   stop("ERROR: chronic_derm_master not loaded properly. Run File 01 first!")
 }
@@ -75,12 +73,12 @@ cat("  Pre-assigned condition columns: ", length(condition_cols), "\n")
 cat("    ", paste(condition_cols, collapse = ", "), "\n")
 ```
 
-## 1. Cohort Overview - Using Master Datasets
+# Cohort Overview, Using Master Datasets
 
 ```{r}
-cat("\n=== 1. CHRONIC DERMATOLOGY COHORT OVERVIEW (MASTER DATASETS) ===\n")
+cat("\n=== 1. CHRONIC DERMATOLOGY COHORT OVERVIEW ===\n")
 
-# VERIFICATION: Compare master vs legacy counts
+# Compare master vs legacy counts
 chronic_derm_patient_ids <- unique(chronic_derm_patient_summary$mrn_deid)
 legacy_patient_ids <- unique(chronic_derm_cohort$mrn_deid)
 
@@ -89,7 +87,7 @@ cat("  Master dataset patients:", length(chronic_derm_patient_ids), "\n")
 cat("  Legacy dataset patients:", length(legacy_patient_ids), "\n")
 cat("  Difference:", length(chronic_derm_patient_ids) - length(legacy_patient_ids), "\n")
 
-# Use MASTER datasets for all analysis
+# Use masterr datasets for all analysis
 chronic_derm_encounters <- chronic_derm_master  # Pre-filtered and standardized
 chronic_derm_phq_status <- chronic_derm_patient_summary  # Pre-calculated patient summaries
 
@@ -106,7 +104,7 @@ cat("Patients with subclinical depression (5-9):", sum(chronic_derm_phq_status$e
 cat("Patients with PHQ data:", sum(chronic_derm_phq_status$phq_encounters > 0), 
     " (", round(mean(chronic_derm_phq_status$phq_encounters > 0) * 100, 1), "%)\n")
 
-# Clinical/Subclinical distribution
+# Clinical/subclinical distribution
 depression_summary <- chronic_derm_phq_status[, .(
   clinical_n = sum(ever_clinical),
   subclinical_n = sum(ever_subclinical),
@@ -123,7 +121,7 @@ cat("\nDepression Classification (Patient-level):\n")
 print(depression_summary)
 ```
 
-## 2. Demographic Summary
+# Demographic Summary
 
 ```{r}
 cat("\n=== 2. DEMOGRAPHIC SUMMARY ===\n")
@@ -178,17 +176,16 @@ if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
 write.csv(demo_summary, file.path(csv_dir, "Chronic_Derm_Cohort_Summary.csv"), row.names = FALSE)
 ```
 
-## 3. Condition-Specific Summary - Using Master Condition Assignments
+## 3. Condition-specific summary - using master condition 
 
 ```{r}
 cat("\n=== 3. CONDITION-SPECIFIC SUMMARY (MASTER CONDITIONS) ===\n")
 
-# NO MORE CONDITION REDEFINITION - Use master assignments from File 01
 cat("Using pre-assigned conditions from File 01 master datasets\n")
 cat("Verified condition counts from File 01:\n")
 print(condition_patient_counts)
 
-# Create condition summary using MASTER condition assignments
+# Create condition summary 
 condition_summary_list <- list()
 condition_names <- names(chronic_derm_patient_conditions)
 
@@ -223,28 +220,28 @@ for(i in 1:nrow(condition_summary)) {
 cat("\nCondition-specific results:\n")
 print(condition_summary)
 
-# ===== FINAL VERIFICATION SYSTEM =====
+#  FINAL VERIFICATION SYSTEM 
 cat("\n=== FILE 03 FINAL VERIFICATION ===\n")
 verify_file03_consistency <- function() {
   cat("ACNE COUNT VERIFICATION:\n")
   
-  # Method 1: Master count
+  # Master count
   master_acne_count <- condition_patient_counts[["Acne"]]
   cat("  Master dataset (File 01): ", master_acne_count, " patients\n")
   
-  # Method 2: Current condition summary
+  # Current condition summary
   current_acne_count <- condition_summary[condition_type == "Acne", total_patients]
   cat("  Current summary (File 03): ", current_acne_count, " patients\n")
   
-  # Method 3: Direct count from patient conditions
+  # Direct count from patient conditions
   direct_acne_count <- length(chronic_derm_patient_conditions[["Acne"]])
   cat("  Direct from patient conditions: ", direct_acne_count, " patients\n")
   
   # Check consistency
   if(master_acne_count == current_acne_count && current_acne_count == direct_acne_count) {
-    cat("  ✅ ALL COUNTS MATCH - CONSISTENCY ACHIEVED!\n")
+    cat("  ALL COUNTS MATCH \n")
   } else {
-    cat("  ❌ COUNTS DO NOT MATCH - INVESTIGATE DISCREPANCY\n")
+    cat("  COUNTS DO NOT MATCH \n")
   }
   
   cat("\nALL CONDITIONS VERIFICATION:\n")
@@ -252,7 +249,7 @@ verify_file03_consistency <- function() {
     master_count <- condition_patient_counts[[condition_name]]
     current_count <- condition_summary[condition_type == condition_name, total_patients]
     if(length(current_count) == 0) current_count <- 0
-    status <- if(master_count == current_count) "✅" else "❌"
+    status <- if(master_count == current_count) "good" else "not good"
     cat(paste0("  ", condition_name, ": Master=", master_count, ", Current=", current_count, " ", status, "\n"))
   }
 }
@@ -302,11 +299,9 @@ cat("Conditions analyzed:", nrow(condition_summary), "\n")
 cat("Analysis uses clinical (10+) and subclinical (5-9) depression thresholds from File 01\n")
 ```
 
-## ADDITIONAL COMPARATIVE TABLES
-
 ### Clinical Depression Analysis (PHQ ≥10)
 
-#### Table 1A: Clinical Depression - Pairwise Comparisons Between Demographic Levels
+#### Table 1A: clinical depression - pairwise comparisons between demographic levels
 
 ```{r}
 # Pairwise comparisons of clinical depression rates between levels within each demographic variable  
@@ -356,7 +351,7 @@ if(nrow(chronic_derm_with_phq) > 20) {
             sex1_rate <- round(sex1_clinical/sex1_total*100, 1)
             sex2_rate <- round(sex2_clinical/sex2_total*100, 1)
             
-            # Calculate OR and 95% CI
+            # OR and 95% CI
             odds_ratio <- fisher_test$estimate
             ci_lower <- fisher_test$conf.int[1]
             ci_upper <- fisher_test$conf.int[2]
@@ -603,10 +598,10 @@ if(nrow(chronic_derm_with_phq) > 20) {
 }
 ```
 
-#### Table 2A: Clinical Depression Rates by Condition
+# Table 2A: Clinical Depression Rates by Condition
 
 ```{r}
-# Create patient_condition_pairs from master datasets (needed for compatibility)
+# Create patient_condition_pairs
 patient_condition_pairs_list <- list()
 for(condition_name in names(chronic_derm_patient_conditions)) {
   condition_patients <- chronic_derm_patient_conditions[[condition_name]]
@@ -620,7 +615,7 @@ for(condition_name in names(chronic_derm_patient_conditions)) {
 patient_condition_pairs <- rbindlist(patient_condition_pairs_list)
 setDT(patient_condition_pairs)
 
-# Simple descriptive table of clinical depression rates by condition
+# table of clinical depression rates by condition
 chronic_with_conditions <- merge(chronic_derm_phq_status, 
                                 patient_condition_pairs, 
                                 by = "mrn_deid", all.x = TRUE)
@@ -692,7 +687,6 @@ if(nrow(clinical_by_condition) > 0) {
 #### Table 3A: Pairwise Clinical Depression Comparisons Between Conditions
 
 ```{r}
-# Pairwise comparisons of clinical depression rates between conditions
 conditions <- unique(patient_condition_pairs$condition_type)
 clinical_pairwise_results <- list()
 
@@ -778,7 +772,7 @@ if(length(clinical_pairwise_results) > 0) {
       gt() %>%
       tab_header(
         title = "Supplementary Table 3. Hidradenitis Suppurativa Shows Significantly Higher Clinical Depression Rates Than Most Other Dermatologic Conditions",
-        subtitle = "Pairwise comparisons between chronic dermatologic conditions showing significant differences (P < .05). Statistical tests performed using Fisher exact test. Rate difference calculated as absolute percentage point difference."
+        subtitle = "Pairwise comparisons between chronic dermatologic conditions showing significant differences (P < .05). Statistical tests performed using Fisher exact test."
       ) %>%
       cols_label(
         Comparison = "Comparison",
@@ -809,7 +803,7 @@ if(length(clinical_pairwise_results) > 0) {
 }
 ```
 
-### Subclinical Depression Analysis (PHQ 5-9)
+### Subclinical
 
 #### Table 1B: Subclinical Depression - Pairwise Comparisons Between Demographic Levels
 
@@ -1074,10 +1068,10 @@ if(nrow(chronic_derm_with_phq) > 20) {
 }
 ```
 
-#### Table 2B: Subclinical Depression Rates by Condition
+# Table 2B: Subclinical Depression Rates by Condition
 
 ```{r}
-# Simple descriptive table of subclinical depression rates by condition
+# descriptive table of subclinical depression rates by condition
 subclinical_by_condition <- chronic_with_conditions[!is.na(condition_type), .(
   n_patients = .N,
   subclinical_n = sum(ever_subclinical),
@@ -1146,7 +1140,7 @@ for(i in 1:(length(conditions)-1)) {
       cond2_subclinical <- sum(cond2_data$ever_subclinical)
       cond2_total <- nrow(cond2_data)
       
-      # Create 2x2 contingency table
+      # contingency table
       test_matrix <- matrix(c(
         cond1_subclinical, cond1_total - cond1_subclinical,
         cond2_subclinical, cond2_total - cond2_subclinical
@@ -1307,14 +1301,13 @@ if (exists("subclinical_condition_table")) {
 
 cat("File 03 table saving complete.\n")
 
-cat("\n=== GENERATING SUPPLEMENTARY TABLES FOR ALL PAIRWISE COMPARISONS ===\n")
+cat("\nGENERATING SUPPLEMENTARY TABLES FOR ALL PAIRWISE COMPARISONS\n")
 
-# Generate comprehensive supplementary tables with all comparisons (significant and non-significant)
+# Generate tables with all comparisons (significant and non-significant)
 if(exists("clinical_pairwise_results") && length(clinical_pairwise_results) > 0) {
   
   cat("Found", length(clinical_pairwise_results), "clinical pairwise results\n")
   
-  # Add error handling for data.frame construction
   tryCatch({
     # Convert all clinical results to data frame with safe extraction
     all_clinical_results_df <- data.frame(
@@ -1416,7 +1409,7 @@ if(exists("clinical_pairwise_results") && length(clinical_pairwise_results) > 0)
   cat("No clinical pairwise results available for supplementary table\n")
 }
 
-# Supplementary Table S5 for subclinical comparisons if they exist
+# Supplementary Table S5 for subclinical comparisons 
 if(exists("subclinical_pairwise_results") && length(subclinical_pairwise_results) > 0) {
   
   cat("Found", length(subclinical_pairwise_results), "subclinical pairwise results\n")
