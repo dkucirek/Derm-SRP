@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-## Load Libraries and Data
+## Load libraries and data
 
 ```{r load_data}
 library(data.table)
@@ -38,16 +38,13 @@ setDT(result_wide)
 setDT(patient_data)
 ```
 
-## Prep: Build Columns Expected by Downstream Analysis
+# Prep: Build columns for downstream analysis
 
 ```{r prep}
-# Encounter-level any-clinical-depression flag (PHQ-9 >= 10).
-# Severity strata (mild/moderate/mod-severe/severe) are NOT created at encounter
-# level — they get assigned at patient level in the outcomes chunk based on
-# each patient's worst score (per Methods).
+# Encounter-level any clinical depression flag (PHQ-9 >= 10).
 result_wide[, phq_any_clinical_depression := !is.na(phq_score) & phq_score >= 10]
 
-# Suicidal ideation from PHQ-9 Item 9 (>= 1 = endorsed)
+# SI from PHQ-9 item 9 
 si_col <- grep("thoughts.*dead|thoughts.*hurting", names(result_wide),
                value = TRUE, ignore.case = TRUE)
 if (length(si_col) > 0) {
@@ -67,7 +64,7 @@ cat("Chronic derm:", sum(patient_data$is_chronic_derm), "\n")
 cat("Controls:", sum(!patient_data$is_chronic_derm), "\n")
 ```
 
-## Propensity Score Matching
+## Propensity score matching
 
 ```{r matching}
 set.seed(42)
@@ -99,14 +96,14 @@ cat("Max SMD:", round(max(abs(bal)), 3), "\n")
 cat("Per-variable SMDs (matched cohort):\n")
 print(round(bal, 4))
 
-# Save SMDs to CSV for reproducibility
+# Save SMDs to CSV 
 fwrite(data.table(Variable = names(bal), SMD = round(as.numeric(bal), 4)),
        file.path(csv_dir, "Per_Variable_SMDs.csv"))
 
 saveRDS(matched_data, file.path(data_path, "matched_data.rds"))
 ```
 
-## Patient-Level Outcomes
+## Patient-level outcomes
 
 ```{r outcomes}
 matched_mrns <- unique(matched_data$mrn_deid)
@@ -114,7 +111,7 @@ matched_mrns <- unique(matched_data$mrn_deid)
 phq_data <- result_wide[mrn_deid %in% matched_mrns]
 phq_data <- merge(phq_data, matched_data[, .(mrn_deid, is_chronic_derm)], by = "mrn_deid")
 
-# Patient-level aggregation — keep max score, any-clinical-depression, and SI
+# Patient-level aggregation, keep max score, any clinical depression, and SI
 patient_outcomes <- phq_data[, .(
   max_phq                 = max(phq_score, na.rm = TRUE),
   any_clinical_depression = any(phq_any_clinical_depression, na.rm = TRUE),
@@ -123,8 +120,7 @@ patient_outcomes <- phq_data[, .(
 
 patient_outcomes[is.infinite(max_phq), max_phq := NA]
 
-# Assign mutually exclusive severity strata based on each patient's WORST PHQ score
-# (per Methods: "the highest recorded PHQ score was used to describe their symptom severity")
+# mutually exclusive severity based on patient's worst PHQ score
 patient_outcomes[, `:=`(
   mild       = !is.na(max_phq) & max_phq >= 5  & max_phq < 10,
   moderate   = !is.na(max_phq) & max_phq >= 10 & max_phq < 15,
@@ -144,7 +140,7 @@ print(patient_outcomes[, .(
 ), by = is_chronic_derm])
 ```
 
-## Main Analyses (Modified Poisson Risk Ratios)
+## modified Poisson RR
 
 ```{r main_analyses}
 get_rr <- function(outcome_var, title) {
@@ -154,7 +150,7 @@ get_rr <- function(outcome_var, title) {
     group = as.numeric(is_chronic_derm)
   )]
 
-  # Modified Poisson with robust SE for risk ratio
+  # mod Poisson with SE 
   model <- glm(outcome_num ~ group, family = poisson(link = "log"), data = reg_data)
   robust <- coeftest(model, vcov = sandwich)
 
@@ -165,7 +161,7 @@ get_rr <- function(outcome_var, title) {
   ci_hi  <- exp(log_rr + 1.96 * se)
   p      <- robust[2, "Pr(>|z|)"]
 
-  # Cell counts for display
+  # Cell counts
   n00 <- patient_outcomes[is_chronic_derm == FALSE & get(outcome_var) == FALSE, .N]
   n01 <- patient_outcomes[is_chronic_derm == FALSE & get(outcome_var) == TRUE,  .N]
   n10 <- patient_outcomes[is_chronic_derm == TRUE  & get(outcome_var) == FALSE, .N]
@@ -182,27 +178,27 @@ get_rr <- function(outcome_var, title) {
   list(table = tbl, rr = c(rr, ci_lo, ci_hi), p = p)
 }
 
-# Mutually exclusive severity strata (patient-level, by worst score)
+# Mutually exclusive severity (patient-level by worst score)
 mild_res         <- get_rr("mild",       "Mild (PHQ 5-9)")
 moderate_res     <- get_rr("moderate",   "Moderate (PHQ 10-14)")
 mod_severe_res   <- get_rr("mod_severe", "Moderately Severe (PHQ 15-19)")
 severe_res       <- get_rr("severe",     "Severe (PHQ 20-27)")
 
-# Any clinical depression (PHQ-9 >= 10)
+# Any clinical depression
 any_clinical_res <- get_rr("any_clinical_depression", "Any Clinical Depression (PHQ-9 >= 10)")
 
-# Safety outcome
+# SI 
 si_res           <- get_rr("si", "Suicidal Ideation (Item 9 > 0)")
 ```
 
-## Sensitivity Analyses
+## Sensitivity analyses
 
 ```{r sensitivity}
 cat("\n========================================\n")
 cat("SENSITIVITY ANALYSES\n")
 cat("========================================\n")
 
-# 1. Continuous PHQ
+# Continuous PHQ
 cat("\n--- Continuous PHQ-9 ---\n")
 cont_data <- patient_outcomes[!is.na(max_phq)]
 
@@ -224,7 +220,7 @@ cat("Mean Diff:", round(mean_diff, 2),
     "(95% CI:", round(mean_diff - 1.96*se_diff, 2), "to", round(mean_diff + 1.96*se_diff, 2), ")\n")
 cat("P:", format_p(p_cont), "\n")
 
-# 2. E-Values for significant findings
+# E-Values 
 cat("\n--- E-Values ---\n")
 
 calc_evalue <- function(rr, ci_lo) {
@@ -249,25 +245,9 @@ cat("Any Clinical:     RR =", round(any_clinical_res$rr[1], 2), "E-value =", ev_
 cat("Suicidal Ideation: RR =", round(si_res$rr[1], 2),          "E-value =", ev_si[1], "\n")
 ```
 
-## Prior Psychiatric History (Manuscript "Behavioral Health Visit" Claim)
+## Prior psychiatric hx 
 
 ```{r bh_visits}
-# Per manuscript Discussion: "only 3% (n=154) of the dermatology cohort had
-# recorded behavioral health visits within the three-year study period, less
-# than half of those with clinical depression symptoms."
-#
-# This corresponds to the `has_psych_condition` flag built in File 02:
-# psychiatric/behavioral-health visit BEFORE the index dermatologic encounter
-# (i.e., prior psych history). This same flag is used as a matching covariate.
-#
-# This chunk reports two views:
-#   1. has_psych_condition in the full matched cohort (chronic derm vs control)
-#   2. has_psych_condition AMONG patients with PHQ-9 >=10 (clinical depression)
-
-cat("\n========================================\n")
-cat("PRIOR PSYCHIATRIC HISTORY\n")
-cat("========================================\n")
-
 # Bring has_psych_condition from matched_data into patient-level frame
 prior_psych_data <- merge(
   patient_outcomes[, .(mrn_deid, is_chronic_derm, any_clinical_depression)],
@@ -275,7 +255,7 @@ prior_psych_data <- merge(
   by = "mrn_deid"
 )
 
-# Coerce factor TRUE/FALSE to logical for arithmetic
+# T/f to logical for arithmetic
 prior_psych_data[, has_psych := as.logical(has_psych_condition == TRUE | has_psych_condition == "TRUE")]
 
 # ---- Part 1: Prior psych in the FULL matched cohort ----
@@ -287,7 +267,7 @@ prior_all <- prior_psych_data[, .(
 ), by = is_chronic_derm]
 print(as.data.frame(prior_all))
 
-# ---- Part 2: Prior psych among PHQ-9 >= 10 patients ----
+# prior psych among PHQ-9 >= 10 patients 
 cat("\n--- Prior psych history among PHQ-9 >=10 ---\n")
 prior_phq10 <- prior_psych_data[any_clinical_depression == TRUE, .(
   n_phq10       = .N,
@@ -296,7 +276,7 @@ prior_phq10 <- prior_psych_data[any_clinical_depression == TRUE, .(
 ), by = is_chronic_derm]
 print(as.data.frame(prior_phq10))
 
-# 2x2 + chi-square test for the proportion difference (PHQ-9 >=10 subset)
+# 2x2 and chi-square test 
 phq10_data <- prior_psych_data[any_clinical_depression == TRUE]
 prior_tab <- with(phq10_data, table(is_chronic_derm, has_psych))
 cat("\n2x2 table (rows = is_chronic_derm, cols = has_psych) among PHQ-9 >=10:\n")
@@ -306,7 +286,7 @@ prior_chi <- chisq.test(prior_tab)
 cat("\nChi-square test for proportion difference (PHQ-9 >=10 subset): P =",
     format_p(prior_chi$p.value), "\n")
 
-# Risk ratio for prior psych (chronic derm vs control), modified Poisson, PHQ-9 >=10 subset
+# RR for prior psych (chronic derm vs control), modified Poisson, PHQ-9 >=10 
 phq10_data[, prior_num := as.numeric(has_psych)]
 phq10_data[, group := as.numeric(is_chronic_derm)]
 prior_model <- glm(prior_num ~ group, family = poisson(link = "log"), data = phq10_data)
@@ -347,23 +327,9 @@ fwrite(prior_output, file.path(csv_dir, "Prior_Psych_History.csv"))
 cat("\nSaved:", file.path(csv_dir, "Prior_Psych_History.csv"), "\n")
 ```
 
-## Interaction Analyses
+## Interactions
 
 ```{r interactions}
-# Per Methods: "Poisson regression with interaction terms was used for
-# interaction analyses between depression symptoms, race and sex."
-#
-# Models fit on the matched cohort. Outcome = any clinical depression (PHQ-9
-# >= 10) at the patient level. Modified Poisson with sandwich SE.
-#
-# Reports per-level interaction term P values, the joint LR test for each
-# interaction (across all levels of the categorical modifier), and stratified
-# RRs within each subgroup. Outputs saved to CSV.
-
-cat("\n========================================\n")
-cat("INTERACTION ANALYSES\n")
-cat("========================================\n")
-
 # Re-attach matching covariates to patient_outcomes
 interaction_data <- merge(
   patient_outcomes,
@@ -372,7 +338,7 @@ interaction_data <- merge(
   by = "mrn_deid"
 )
 
-# Drop sex == "Unknown" and clean factor levels
+# Drop sex "unknown" and clean factor levels
 interaction_data <- interaction_data[sex != "Unknown" & !is.na(race_ethnicity_combined)]
 interaction_data[, sex := droplevels(factor(sex))]
 interaction_data[, race_ethnicity_combined := droplevels(factor(race_ethnicity_combined))]
@@ -384,8 +350,8 @@ cat("Analysis sample:", nrow(interaction_data), "patients\n")
 cat("  Chronic derm:", sum(interaction_data$is_chronic_derm), "\n")
 cat("  Controls:    ", sum(!interaction_data$is_chronic_derm), "\n\n")
 
-# ----- Race/ethnicity x chronic_derm -----
-cat("--- RACE/ETHNICITY x CHRONIC_DERM ---\n")
+#  Race/ethnicity x chronic_derm 
+cat(" RACE/ETHNICITY by CHRONIC_DERM \n")
 
 race_int_model <- glm(
   any_clinical_num ~ group * race_ethnicity_combined +
@@ -403,7 +369,7 @@ for (t in race_int_terms) {
       ", P =", format_p(race_int_robust[t, "Pr(>|z|)"]), "\n")
 }
 
-# Joint LR test against no-interaction model
+# Joint LR test 
 race_main_model <- glm(
   any_clinical_num ~ group + race_ethnicity_combined +
                      age_at_encounter + sex + fin_class + has_psych_condition,
@@ -442,8 +408,8 @@ for (lvl in levels(interaction_data$race_ethnicity_combined)) {
   )
 }
 
-# ----- Sex x chronic_derm -----
-cat("\n--- SEX x CHRONIC_DERM ---\n")
+#  Sex x chronic_derm 
+cat("\n sex x chronic derm \n")
 
 sex_int_model <- glm(
   any_clinical_num ~ group * sex +
@@ -499,7 +465,7 @@ for (lvl in levels(interaction_data$sex)) {
   )
 }
 
-# ----- Save -----
+#  Save 
 interaction_summary <- data.table(
   Modifier = c("Race/Ethnicity", "Sex"),
   Joint_P_Value = c(format_p(race_joint_p), format_p(sex_joint_p))
@@ -514,7 +480,7 @@ cat("  ", file.path(csv_dir, "Interaction_Tests.csv"), "\n")
 cat("  ", file.path(csv_dir, "Stratified_RRs_By_Subgroup.csv"), "\n")
 ```
 
-## Summary Table
+# Summary Table
 
 ```{r summary_table}
 summary_results <- data.table(
@@ -563,7 +529,6 @@ summary_gt <- tab_footnote(summary_gt,
 
 print(summary_gt)
 
-# PNG save disabled — Chrome not available on WinStats
 # gtsave(summary_gt, file.path(tables_dir, "Combined_Cohort_Severity.png"))
 
 fwrite(summary_results, file.path(csv_dir, "Combined_Cohort_Severity.csv"))
