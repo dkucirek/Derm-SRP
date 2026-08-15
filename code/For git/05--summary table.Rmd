@@ -43,13 +43,13 @@ fig1 <- ggplot(fig1_data, aes(y = Outcome, x = Estimate)) +
                 orientation = "y") +
   geom_point(shape = 18, size = 4, color = "#1F4E79") +
   scale_x_continuous(
-    name   = "Risk Ratio (95% CI)",
+    name   = "Prevalence Ratio (95% CI)",
     limits = c(0.9, 2.2),
     breaks = c(1.0, 1.2, 1.4, 1.6, 1.8, 2.0)
   ) +
   scale_y_discrete(name = "") +
   labs(
-    title    = "Figure 1. Depression Symptom Risk by PHQ 9 Score in Dermatologic Patients vs Matched Controls",
+    title    = "Figure 1. Depression Symptom Prevalence by PHQ 9 Score in Dermatologic Patients vs Matched Controls",
     subtitle = "4,535 cohort patients vs 88,668 propensity score matched controls"
   ) +
   theme_classic(base_size = 12) +
@@ -97,12 +97,12 @@ fig2 <- ggplot(fig2_data, aes(y = Condition, x = RR)) +
     name   = "Significance"
   ) +
   scale_shape_manual(
-    values = c("TRUE" = 18, "FALSE" = 18),
+    values = c("TRUE" = 18, "FALSE" = 5),
     labels = c("TRUE" = "Yes", "FALSE" = "No"),
     name   = "Significance"
   ) +
   scale_x_continuous(
-    name   = "Risk Ratio (95% CI)",
+    name   = "Prevalence Ratio (95% CI)",
     limits = c(0.2, 3.2),
     breaks = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
   ) +
