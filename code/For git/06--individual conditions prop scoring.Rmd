@@ -37,8 +37,8 @@ format_p <- function(p) {
 
 get_rr <- function(data, outcome, group) {
   tryCatch({
-    model <- glm(as.formula(paste(outcome, "~", group)), family = poisson(link = "log"), data = data)
-    robust <- coeftest(model, vcov = sandwich)
+    model <- glm(as.formula(paste(outcome, "~", group)), family = poisson(link = "log"), data = data, weights = data$weights)
+    robust <- coeftest(model, vcov = vcovCL(model, cluster = data$subclass))
     log_rr <- robust[2, "Estimate"]
     se <- robust[2, "Std. Error"]
     list(rr = round(exp(log_rr), 2), ci_lo = round(exp(log_rr - 1.96 * se), 2), 
@@ -67,7 +67,7 @@ patient_data <- patient_data[sex != "Unknown" & !is.na(race_ethnicity_combined)]
 cat("Data loaded\n")
 ```
 
-## Prep
+## Prep: Build Encounter-Level Flags Required Downstream
 
 ```{r prep}
 # Encounter-level any-clinical-depression flag (PHQ-9 >= 10).
@@ -77,7 +77,7 @@ cat("Data loaded\n")
 # describe their symptom severity").
 result_wide[, phq_any_clinical_depression := !is.na(phq_score) & phq_score >= 10]
 
-# Suicidal ideation
+# Suicidal ideation from PHQ-9 Item 9 (>= 1 = endorsed)
 si_col <- grep("thoughts.*dead|thoughts.*hurting", names(result_wide),
                value = TRUE, ignore.case = TRUE)
 if (length(si_col) > 0) {
@@ -108,7 +108,7 @@ chronic_icd <- list(
 )
 ```
 
-## Matching conditions
+## Match Each Condition
 
 ```{r matching}
 # Single seed before the loop — each condition's matchit gets a different but
@@ -146,7 +146,7 @@ for (cond in names(chronic_icd)) {
 cat("\n=== Processed", length(condition_cohorts), "conditions ===\n")
 ```
 
-## Analyze conditions
+## Analyze Each Condition
 
 ```{r analyze}
 results <- data.table()
@@ -158,9 +158,9 @@ for (cond in names(condition_cohorts)) {
   ctrl_mrns <- matched[treat == 0, mrn_deid]
   
   # Patient-level aggregation: max PHQ score, any clinical depression, SI.
-  # Severity (mild/moderate/mod-severe/severe) from max_phq
-
-agg_outcomes <- function(mrns, grp) {
+  # Severity strata (mild/moderate/mod-severe/severe) are derived from max_phq
+  # AFTER aggregation, ensuring mutual exclusivity per Methods.
+agg_outcomes <- function(mrns, grp, wt_lookup) {
     phq <- result_wide[mrn_deid %in% mrns]
     out <- phq[, .(
       max_phq = max(phq_score, na.rm = TRUE),
@@ -168,6 +168,7 @@ agg_outcomes <- function(mrns, grp) {
       si = any(phq_si, na.rm = TRUE)
     ), by = mrn_deid]
     out[is.infinite(max_phq), max_phq := NA]
+    out <- merge(out, wt_lookup, by = "mrn_deid")
     
     # Mutually exclusive severity, assigned by patient's worst score
     out[, `:=`(
@@ -180,8 +181,9 @@ agg_outcomes <- function(mrns, grp) {
     out
   }
   
-  case_out <- agg_outcomes(case_mrns, 1)
-  ctrl_out <- agg_outcomes(ctrl_mrns, 0)
+wt_lookup <- matched[, .(mrn_deid, weights, subclass)]
+case_out <- agg_outcomes(case_mrns, 1, wt_lookup)
+ctrl_out <- agg_outcomes(ctrl_mrns, 0, wt_lookup)
   combined <- rbind(case_out, ctrl_out)
   combined[, `:=`(
     mild_num = as.numeric(mild),
@@ -195,7 +197,7 @@ agg_outcomes <- function(mrns, grp) {
   n_case <- nrow(case_out)
   n_ctrl <- nrow(ctrl_out)
   
-  # RR  - mutually exclusive
+  # RR calculations - mutually exclusive severity strata
   mild_rr <- get_rr(combined, "mild_num", "group")
   mod_rr  <- get_rr(combined, "moderate_num", "group")
   ms_rr   <- get_rr(combined, "mod_severe_num", "group")
@@ -214,10 +216,11 @@ agg_outcomes <- function(mrns, grp) {
   }
   
   # Continuous PHQ
+  # Continuous PHQ
   cont <- combined[!is.na(max_phq)]
   if (nrow(cont) > 10) {
-    lm_fit <- lm(max_phq ~ group, data = cont)
-    robust_lm <- coeftest(lm_fit, vcov = vcovHC(lm_fit, type = "HC1"))
+    lm_fit <- lm(max_phq ~ group, data = cont, weights = cont$weights)
+    robust_lm <- coeftest(lm_fit, vcov = vcovCL(lm_fit, cluster = cont$subclass, type = "HC1"))
     phq_diff <- robust_lm["group", "Estimate"]
     phq_p <- robust_lm["group", "Pr(>|t|)"]
   } else {
@@ -249,7 +252,7 @@ agg_outcomes <- function(mrns, grp) {
     AnyClin_ctrl_pct = round(sum(ctrl_out$any_clinical_depression) / n_ctrl * 100, 1),
     AnyClin_RR = any_clinical_rr$rr, AnyClin_CI_lo = any_clinical_rr$ci_lo, 
     AnyClin_CI_hi = any_clinical_rr$ci_hi, AnyClin_P = any_clinical_rr$p, AnyClin_RD = rd,
-    # SI
+    # Suicidal Ideation
     SI_n = sum(case_out$si), SI_pct = round(sum(case_out$si) / n_case * 100, 1),
     SI_ctrl_n = sum(ctrl_out$si), SI_ctrl_pct = round(sum(ctrl_out$si) / n_ctrl * 100, 1),
     SI_RR = si_rr$rr, SI_CI_lo = si_rr$ci_lo, SI_CI_hi = si_rr$ci_hi, SI_P = si_rr$p,
@@ -262,7 +265,7 @@ agg_outcomes <- function(mrns, grp) {
   ))
 }
 
-# Holm's correction
+# Holm's correction across the 9 conditions per Methods
 results[, `:=`(
   Mild_P_Adj    = p.adjust(Mild_P, method = "holm"),
   Mod_P_Adj     = p.adjust(Mod_P, method = "holm"),
@@ -283,7 +286,7 @@ results[, `:=`(
   PHQ_Sig     = PHQ_P_Adj < 0.05
 )]
 
-cat("\n=== Results (Holm-corrected significance) ===\n")
+cat("\n=== RESULTS (Holm-corrected significance) ===\n")
 cat("Mild (5-9) significant:", sum(results$Mild_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 cat("Moderate (10-14) significant:", sum(results$Mod_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 cat("Mod-Severe (15-19) significant:", sum(results$MS_Sig, na.rm = TRUE), "/", nrow(results), "\n")
@@ -293,12 +296,13 @@ cat("SI significant:", sum(results$SI_Sig, na.rm = TRUE), "/", nrow(results), "\
 cat("Continuous PHQ significant:", sum(results$PHQ_Sig, na.rm = TRUE), "/", nrow(results), "\n")
 ```
 
-## Pairwise comparisons (Tukey's)
+## Pairwise Comparisons (Tukey's)
 
 ```{r pairwise}
-cat("\n=== Pairwise Comparisons (Any Clinical Depression) ===\n")
+cat("\n=== PAIRWISE COMPARISONS (Any Clinical Depression) ===\n")
 
-# patient-level any clinical depression flag by condition
+# Build patient-level any-clinical-depression flag PER CONDITION using max-score logic
+# (consistent with the per-condition aggregation above)
 all_cond <- rbindlist(lapply(names(condition_cohorts), function(cond) {
   mrns <- condition_cohorts[[cond]][treat == 1, mrn_deid]
   phq  <- result_wide[mrn_deid %in% mrns]
@@ -329,10 +333,10 @@ tryCatch({
 }, error = function(e) cat("Error:", e$message, "\n"))
 ```
 
-# Tables
+## Tables
 
 ```{r tables}
-# Table 2: Depression severity by condition (mutually exclusive)
+# Table 2: Depression Severity by Condition (Mutually Exclusive)
 table2 <- results[, .(
   Condition, N = N_Case,
   `Mild 5-9 n(%)`     = paste0(Mild_n, " (", Mild_pct, ")"),
@@ -350,7 +354,7 @@ print(table2_gt)
 # gtsave disabled — Chrome not available on WinStats
 # gtsave(table2_gt, file.path(figures_dir, "Table2_Severity.png"))
 
-# Table 3: Depression severity RRs
+# Table 3: Depression Severity RRs
 table3 <- results[, .(
   Condition,
   `Mild RR`    = Mild_RR, `Mild P`    = ifelse(Mild_Sig, paste0(format_p(Mild_P), "*"),    format_p(Mild_P)),
@@ -367,7 +371,7 @@ table3_gt <- table3 |> gt() |>
 print(table3_gt)
 # gtsave(table3_gt, file.path(figures_dir, "Table3_Severity_RR.png"))
 
-# Table 4: Any clinical depression (PHQ >= 10)
+# Table 4: Any Clinical Depression (PHQ >= 10)
 table4 <- results[, .(
   Condition,
   `Cases n (%)`     = paste0(AnyClin_n, " (", AnyClin_pct, ")"),
@@ -385,7 +389,7 @@ table4_gt <- table4 |> gt() |>
 print(table4_gt)
 # gtsave(table4_gt, file.path(figures_dir, "Table4_AnyClinicalDepression.png"))
 
-# Table 5: SI
+# Table 5: Suicidal Ideation
 table5 <- results[, .(
   Condition,
   `Cases n (%)`    = paste0(SI_n, " (", SI_pct, ")"),
@@ -476,7 +480,7 @@ if (nrow(sig_results) > 0) {
 }
 ```
 
-# Save
+## Save
 
 ```{r save}
 fwrite(results, file.path(csv_dir, "All_Condition_Results.csv"))
