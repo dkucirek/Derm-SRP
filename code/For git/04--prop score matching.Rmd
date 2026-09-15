@@ -221,8 +221,8 @@ cat("Chronic: Mean =", round(mean(chronic_phq), 2), "SD =", round(sd(chronic_phq
 cat("Control: Mean =", round(mean(control_phq), 2), "SD =", round(sd(control_phq), 2), "\n")
 
 cont_data[, group := as.numeric(is_chronic_derm)]
-lm_fit <- lm(max_phq ~ group, data = cont_data)
-robust_se <- coeftest(lm_fit, vcov = vcovHC(lm_fit, type = "HC1"))
+lm_fit <- lm(max_phq ~ group, data = cont_data, weights = cont_data$weights)
+robust_se <- coeftest(lm_fit, vcov = vcovCL(lm_fit, cluster = cont_data$subclass, type = "HC1"))
 
 mean_diff <- robust_se["group", "Estimate"]
 se_diff <- robust_se["group", "Std. Error"]
@@ -278,7 +278,7 @@ cat("========================================\n")
 
 # Bring has_psych_condition from matched_data into patient-level frame
 prior_psych_data <- merge(
-  patient_outcomes[, .(mrn_deid, is_chronic_derm, any_clinical_depression)],
+  patient_outcomes[, .(mrn_deid, is_chronic_derm, any_clinical_depression, weights, subclass)],
   matched_data[, .(mrn_deid, has_psych_condition)],
   by = "mrn_deid"
 )
@@ -317,8 +317,8 @@ cat("\nChi-square test for proportion difference (PHQ-9 >=10 subset): P =",
 # Risk ratio for prior psych (chronic derm vs control), modified Poisson, PHQ-9 >=10 subset
 phq10_data[, prior_num := as.numeric(has_psych)]
 phq10_data[, group := as.numeric(is_chronic_derm)]
-prior_model <- glm(prior_num ~ group, family = poisson(link = "log"), data = phq10_data)
-prior_robust <- coeftest(prior_model, vcov = sandwich)
+prior_model <- glm(prior_num ~ group, family = poisson(link = "log"), data = phq10_data, weights = phq10_data$weights)
+prior_robust <- coeftest(prior_model, vcov = vcovCL(prior_model, cluster = phq10_data$subclass))
 prior_est <- prior_robust["group", "Estimate"]
 prior_se  <- prior_robust["group", "Std. Error"]
 prior_rr  <- exp(prior_est)
@@ -399,10 +399,10 @@ race_int_model <- glm(
   any_clinical_num ~ group * race_ethnicity_combined +
                      age_at_encounter + sex + fin_class + has_psych_condition,
   family = poisson(link = "log"),
-  data = interaction_data
+  data = interaction_data,
+  weights = interaction_data$weights
 )
-
-race_int_robust <- coeftest(race_int_model, vcov = sandwich)
+race_int_robust <- coeftest(race_int_model, vcov = vcovCL(race_int_model, cluster = interaction_data$subclass))
 race_int_terms <- grep("^group:race_ethnicity_combined", rownames(race_int_robust), value = TRUE)
 
 cat("Per-level interaction term P values:\n")
@@ -416,7 +416,8 @@ race_main_model <- glm(
   any_clinical_num ~ group + race_ethnicity_combined +
                      age_at_encounter + sex + fin_class + has_psych_condition,
   family = poisson(link = "log"),
-  data = interaction_data
+  data = interaction_data,
+  weights = interaction_data$weights
 )
 race_lr <- anova(race_main_model, race_int_model, test = "Chisq")
 race_joint_p <- race_lr$`Pr(>Chi)`[2]
@@ -431,8 +432,8 @@ for (lvl in levels(interaction_data$race_ethnicity_combined)) {
     cat("  ", lvl, ": n too small, skipped\n")
     next
   }
-  m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub)
-  rb <- coeftest(m, vcov = sandwich)
+m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub, weights = sub$weights)
+rb <- coeftest(m, vcov = vcovCL(m, cluster = sub$subclass))
   est <- rb["group", "Estimate"]
   se  <- rb["group", "Std. Error"]
   pv  <- rb["group", "Pr(>|z|)"]
@@ -457,10 +458,10 @@ sex_int_model <- glm(
   any_clinical_num ~ group * sex +
                      age_at_encounter + race_ethnicity_combined + fin_class + has_psych_condition,
   family = poisson(link = "log"),
-  data = interaction_data
+  data = interaction_data,
+  weights = interaction_data$weights
 )
-
-sex_int_robust <- coeftest(sex_int_model, vcov = sandwich)
+sex_int_robust <- coeftest(sex_int_model, vcov = vcovCL(sex_int_model, cluster = interaction_data$subclass))
 sex_int_terms <- grep("^group:sex", rownames(sex_int_robust), value = TRUE)
 
 cat("Per-level interaction term P values:\n")
@@ -473,7 +474,8 @@ sex_main_model <- glm(
   any_clinical_num ~ group + sex +
                      age_at_encounter + race_ethnicity_combined + fin_class + has_psych_condition,
   family = poisson(link = "log"),
-  data = interaction_data
+  data = interaction_data,
+  weights = interaction_data$weights
 )
 sex_lr <- anova(sex_main_model, sex_int_model, test = "Chisq")
 sex_joint_p <- sex_lr$`Pr(>Chi)`[2]
@@ -488,8 +490,8 @@ for (lvl in levels(interaction_data$sex)) {
     cat("  ", lvl, ": n too small, skipped\n")
     next
   }
-  m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub)
-  rb <- coeftest(m, vcov = sandwich)
+m  <- glm(any_clinical_num ~ group, family = poisson(link = "log"), data = sub, weights = sub$weights)
+rb <- coeftest(m, vcov = vcovCL(m, cluster = sub$subclass))
   est <- rb["group", "Estimate"]
   se  <- rb["group", "Std. Error"]
   pv  <- rb["group", "Pr(>|z|)"]
